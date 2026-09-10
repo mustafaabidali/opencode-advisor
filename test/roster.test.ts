@@ -44,6 +44,10 @@ const REAL_WATCHDOG = [
   "      Prefer reading the changed files over trusting the primary's summary.",
 ].join("\n")
 
+function propertyValue(object: object | undefined, key: string): unknown {
+  return Object.entries(object ?? {}).find(([entryKey]) => entryKey === key)?.[1]
+}
+
 describe("parseRoster", () => {
   test("accepts the user's omp roster verbatim", () => {
     // Given / When
@@ -294,7 +298,28 @@ describe("advisor AgentConfig builders", () => {
     })
     expect(config.tools?.["edit"]).toBeTrue()
     expect(config.tools?.["bash"]).toBeTrue()
-    expect(config.tools?.["read"]).toBeFalse()
+    expect(config.tools?.["read"]).toBeUndefined()
+    expect(Object.keys(config.tools ?? {})[0]).toBe("*")
+    expect(config.tools?.["*"]).toBeFalse()
+    expect(Object.keys(config.permission ?? {})[0]).toBe("*")
+    expect(propertyValue(config.permission, "*")).toBe("deny")
+  })
+
+  test("allows only granted investigative permissions after the catch-all deny", () => {
+    // Given
+    const entry = resolveEntry(
+      { name: "Reader", enabled: true, tools: ["read", "grep", "glob"] },
+      DEFAULTS,
+    )
+
+    // When
+    const config = toAgentConfig(entry, "system prompt")
+
+    // Then
+    expect(propertyValue(config.permission, "read")).toBe("allow")
+    expect(propertyValue(config.permission, "grep")).toBe("allow")
+    expect(propertyValue(config.permission, "glob")).toBe("allow")
+    expect(config.permission?.bash).toBe("deny")
   })
 
   test("turns every built-in off for an explicit empty grant", () => {
@@ -330,14 +355,15 @@ describe("advisor AgentConfig builders", () => {
     expect(config.description).toBe("Advisor card delivery")
     expect(config.mode).toBe("subagent")
     expect(config["hidden"]).toBeTrue()
+    expect(Object.keys(config.tools ?? {})[0]).toBe("*")
+    expect(config.tools?.["*"]).toBeFalse()
     expect(config.tools?.["bash"]).toBeTrue()
-    expect(KNOWN_BUILTINS.filter((tool) => tool !== "bash").every(
-      (tool) => config.tools?.[tool] === false,
-    )).toBeTrue()
-    expect(config.permission).toEqual({
-      bash: { "advisor*": "allow", "*": "deny" },
-      edit: "deny",
-      webfetch: "deny",
-    })
+    expect(Object.keys(config.permission ?? {})[0]).toBe("*")
+    expect(Object.entries(config.permission ?? {})).toEqual([
+      ["*", "deny"],
+      ["bash", { "advisor*": "allow", "*": "deny" }],
+      ["edit", "deny"],
+      ["webfetch", "deny"],
+    ])
   })
 })

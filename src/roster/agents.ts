@@ -13,6 +13,11 @@ import {
 } from "./types"
 
 const EDIT_TOOLS = ["edit", "write", "patch", "multiedit"] as const
+const INVESTIGATIVE_TOOLS = ["read", "grep", "glob", "list"] as const
+type PermissionAction = "ask" | "allow" | "deny"
+type PermissionRule = PermissionAction | Record<string, PermissionAction>
+type AdvisorPermission = NonNullable<AgentConfig["permission"]> &
+  Record<string, PermissionRule>
 
 function isKnownBuiltin(value: string): value is KnownBuiltin {
   return KNOWN_BUILTINS.some((tool) => tool === value)
@@ -75,9 +80,22 @@ export function resolveEntry(
 }
 
 function toolsMap(granted: readonly KnownBuiltin[]): Record<string, boolean> {
-  const tools: Record<string, boolean> = {}
-  for (const tool of KNOWN_BUILTINS) tools[tool] = granted.includes(tool)
+  const tools: Record<string, boolean> = { "*": false }
+  for (const tool of granted) tools[tool] = true
   return tools
+}
+
+function permissionMap(entry: AdvisorEntry): AdvisorPermission {
+  const permission: AdvisorPermission = { "*": "deny" }
+  for (const tool of INVESTIGATIVE_TOOLS) {
+    if (entry.tools.includes(tool)) permission[tool] = "allow"
+  }
+  const editGranted = EDIT_TOOLS.some((tool) => entry.tools.includes(tool))
+  permission.edit = editGranted ? "ask" : "deny"
+  permission.bash = entry.tools.includes("bash") ? "ask" : "deny"
+  permission.webfetch = entry.tools.includes("webfetch") ? "ask" : "deny"
+  permission.external_directory = "deny"
+  return permission
 }
 
 function agentConfig(
@@ -85,7 +103,6 @@ function agentConfig(
   model: ModelRef,
   systemPrompt: string,
 ): AgentConfig {
-  const editGranted = EDIT_TOOLS.some((tool) => entry.tools.includes(tool))
   const base = {
     description: `Advisor watchdog: ${entry.name}`,
     mode: "subagent",
@@ -94,12 +111,7 @@ function agentConfig(
     prompt: systemPrompt,
     maxSteps: 12,
     tools: toolsMap(entry.tools),
-    permission: {
-      edit: editGranted ? "ask" : "deny",
-      bash: entry.tools.includes("bash") ? "ask" : "deny",
-      webfetch: entry.tools.includes("webfetch") ? "ask" : "deny",
-      external_directory: "deny",
-    },
+    permission: permissionMap(entry),
   } as const satisfies AgentConfig
   return model.variant === undefined ? base : { ...base, variant: model.variant }
 }
@@ -121,18 +133,18 @@ export function toFallbackAgentConfig(
 }
 
 export function deliveryAgentConfig(): AgentConfig {
-  const tools = toolsMap([])
-  tools["bash"] = true
+  const permission: AdvisorPermission = {
+    "*": "deny",
+    bash: { "advisor*": "allow", "*": "deny" },
+    edit: "deny",
+    webfetch: "deny",
+  }
   return {
     description: "Advisor card delivery",
     mode: "subagent",
     hidden: true,
-    tools,
-    permission: {
-      bash: { "advisor*": "allow", "*": "deny" },
-      edit: "deny",
-      webfetch: "deny",
-    },
+    tools: { "*": false, bash: true },
+    permission,
   } satisfies AgentConfig
 }
 

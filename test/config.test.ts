@@ -8,6 +8,7 @@ import {
   type AdvisorConfig,
   type ConfigEnvironment,
 } from "../src/config"
+import { stripJsonComments } from "../src/config/jsonc"
 
 type FakeFiles = Readonly<Record<string, string | Error>>
 
@@ -24,6 +25,28 @@ const HOME = "/home/tester"
 const CWD = "/work/project"
 const GLOBAL_PATH = join(HOME, ".config", "opencode", "advisor.jsonc")
 const PROJECT_PATH = join(CWD, ".opencode", "advisor.jsonc")
+
+describe("stripJsonComments", () => {
+  test("removes comments while preserving comment markers and escaped quotes in strings", () => {
+    // Given
+    const source = String.raw`{
+      // remove this
+      "url": "https://example.com/a/*kept*/",
+      "quote": "say \"// kept\"", /* remove this too */
+      "enabled": true
+    }`
+
+    // When
+    const parsed: unknown = JSON.parse(stripJsonComments(source))
+
+    // Then
+    expect(parsed).toEqual({
+      url: "https://example.com/a/*kept*/",
+      quote: 'say "// kept"',
+      enabled: true,
+    })
+  })
+})
 
 async function load(
   files: FakeFiles = {},

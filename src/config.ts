@@ -1,6 +1,8 @@
 import { homedir } from "node:os"
 import { join } from "node:path"
 
+import { stripJsonComments } from "./config/jsonc"
+
 export type AdvisorSeverity = "nit" | "concern" | "blocker"
 export type AdvisorLogLevel = "debug" | "info" | "warn" | "error"
 export type ConfigEnvironment = Readonly<Record<string, string | undefined>>
@@ -72,51 +74,6 @@ export const DEFAULTS = {
   ],
   log_level: "info",
 } as const satisfies AdvisorConfig
-
-function stripJsonComments(source: string): string {
-  let result = ""
-  let index = 0
-  let inString = false
-  let escaped = false
-  while (index < source.length) {
-    const current = source[index] ?? ""
-    const next = source[index + 1] ?? ""
-    if (inString) {
-      result += current
-      if (escaped) escaped = false
-      else if (current === "\\") escaped = true
-      else if (current === '"') inString = false
-      index += 1
-      continue
-    }
-    if (current === '"') {
-      inString = true
-      result += current
-      index += 1
-      continue
-    }
-    if (current === "/" && next === "/") {
-      index += 2
-      while (index < source.length && source[index] !== "\n") index += 1
-      continue
-    }
-    if (current === "/" && next === "*") {
-      index += 2
-      while (index < source.length) {
-        if (source[index] === "*" && source[index + 1] === "/") {
-          index += 2
-          break
-        }
-        if (source[index] === "\n") result += "\n"
-        index += 1
-      }
-      continue
-    }
-    result += current
-    index += 1
-  }
-  return result
-}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
