@@ -53,7 +53,7 @@ The plugin loads `~/.config/opencode/advisor.jsonc`, then overlays `<cwd>/.openc
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `true` | Master plugin switch. |
-| `default_model` | `"amazon-bedrock/openai.gpt-5.6-sol:xhigh"` | Reviewer model used when a roster entry omits `model`; mirrors the user's omp Sol role. |
+| `default_model` | `"amazon-bedrock/openai.gpt-5.6-sol:max"` | Reviewer model used when a roster entry omits `model`; mirrors the user's omp Sol role. |
 | `default_fallback` | `"amazon-bedrock/us.anthropic.claude-fable-5-1:xhigh"` | The one retry model used when an entry omits `fallback`; mirrors the user's omp Fable 5.1 role. |
 | `min_severity` | `"nit"` | Lowest note severity delivered: `nit`, `concern`, or `blocker`. |
 | `toast` | `true` | Show an OpenCode toast for each delivered note. |

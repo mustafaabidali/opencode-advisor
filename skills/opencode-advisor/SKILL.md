@@ -139,7 +139,7 @@ Edit `~/.config/opencode/advisor.jsonc` for global behavior and `<repo>/.opencod
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `enabled` | `true` | Master plugin switch. |
-| `default_model` | `"amazon-bedrock/openai.gpt-5.6-sol:xhigh"` | Model used when a roster entry omits `model`. |
+| `default_model` | `"amazon-bedrock/openai.gpt-5.6-sol:max"` | Model used when a roster entry omits `model`. |
 | `default_fallback` | `"amazon-bedrock/us.anthropic.claude-fable-5-1:xhigh"` | Single retry used when an entry omits `fallback`. |
 | `min_severity` | `"nit"` | Lowest delivered severity. |
 | `toast` | `true` | Show a TUI toast for each delivered note. |

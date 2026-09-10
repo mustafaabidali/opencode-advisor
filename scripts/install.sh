@@ -51,8 +51,8 @@ if [[ ! -e "$CONFIG_FILE" && ! -L "$CONFIG_FILE" ]]; then
   // Master switch. OPENCODE_ADVISOR_ENABLED=0 temporarily disables the plugin.
   "enabled": true,
 
-  // Default reviewer model. Sol at xhigh mirrors the user's omp advisor role.
-  "default_model": "amazon-bedrock/openai.gpt-5.6-sol:xhigh",
+  // Default reviewer model. Sol at max mirrors the user's omp advisor role.
+  "default_model": "amazon-bedrock/openai.gpt-5.6-sol:max",
 
   // One fallback only. Fable 5.1 at xhigh mirrors the user's omp fallback role.
   "default_fallback": "amazon-bedrock/us.anthropic.claude-fable-5-1:xhigh",

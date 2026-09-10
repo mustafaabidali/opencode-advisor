@@ -35,7 +35,7 @@ advisors:
   - name: Reviewer (Claude Fable 5.1:xhigh)
     enabled: true
     model: amazon-bedrock/us.anthropic.claude-fable-5-1:xhigh
-    fallback: amazon-bedrock/openai.gpt-5.6-sol:xhigh
+    fallback: amazon-bedrock/openai.gpt-5.6-sol:max
     tools: [read, grep, glob]
     instructions: |
       Take an independent second view. Check constraints and failure paths before commenting.
