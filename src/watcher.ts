@@ -8,6 +8,7 @@ import type {
 
 import type { AdvisorConfig } from "./config"
 import type { Logger } from "./log"
+import { isIgnoredEventType } from "./watcher/events"
 import {
   PassScheduler,
   type PassReason,
@@ -112,35 +113,8 @@ export class Watcher<Timer> {
       case "session.deleted":
         this.evictSession(event.properties.info.id)
         return
-      case "server.instance.disposed":
-      case "installation.updated":
-      case "installation.update-available":
-      case "lsp.client.diagnostics":
-      case "lsp.updated":
-      case "message.removed":
-      case "message.part.updated":
-      case "message.part.removed":
-      case "permission.updated":
-      case "permission.replied":
-      case "session.idle":
-      case "session.compacted":
-      case "file.edited":
-      case "todo.updated":
-      case "command.executed":
-      case "session.diff":
-      case "session.error":
-      case "file.watcher.updated":
-      case "vcs.branch.updated":
-      case "tui.prompt.append":
-      case "tui.command.execute":
-      case "tui.toast.show":
-      case "pty.created":
-      case "pty.updated":
-      case "pty.exited":
-      case "pty.deleted":
-      case "server.connected":
-        return
       default:
+        if (isIgnoredEventType(eventType)) return
         if (this.ignoredRuntimeEventTypes.has(eventType)) return
         this.ignoredRuntimeEventTypes.add(eventType)
         await this.options.log.debug({ msg: "watcher runtime event ignored", type: eventType })

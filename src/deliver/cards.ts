@@ -3,6 +3,7 @@ import type { Event } from "@opencode-ai/sdk"
 import type { AdvisorConfig } from "../config"
 import type { Logger } from "../log"
 import type { Note, NoteStore } from "../notes"
+import { showNoteToast, showToast, type ToastClient } from "./toast"
 import {
   BlockerTransformer,
   type MessagesTransformOutput,
@@ -23,23 +24,12 @@ type ShellRequest = Readonly<{
   body: Readonly<{ agent: "advisor-delivery"; command: "advisor" }>
 }>
 
-type ToastRequest = Readonly<{
-  body: Readonly<{
-    title: string
-    message: string
-    variant: "info" | "warning" | "error"
-    duration: number
-  }>
-}>
-
 export type DeliveryClient = Readonly<{
   session: Readonly<{
     shell: (request: ShellRequest) => Promise<ClientResult>
     abort: (request: Readonly<{ path: Readonly<{ id: string }> }>) => Promise<ClientResult>
   }>
-  tui: Readonly<{
-    showToast: (request: ToastRequest) => Promise<ClientResult>
-  }>
+  tui: ToastClient
 }>
 
 export type DeliveryStore = Pick<NoteStore, "enqueuePending" | "markDelivered" | "removePending">
@@ -92,7 +82,9 @@ export class Deliverer {
       await this.#abort(watchedID)
     }
     if (this.#options.config.toast) {
-      await Promise.all(notes.map((entry) => this.#showNoteToast(entry)))
+      await Promise.all(
+        notes.map((entry) => showNoteToast(this.#options.client.tui, this.#options.log, entry)),
+      )
     }
 
     const noteIDs = notes.map((entry) => entry.id)
@@ -206,27 +198,6 @@ export class Deliverer {
     }
   }
 
-  async #showNoteToast(note: Note): Promise<void> {
-    await this.#showToast({
-      title: `Advisor · ${note.severity}`,
-      message: note.note.slice(0, 240),
-      variant:
-        note.severity === "nit" ? "info" : note.severity === "concern" ? "warning" : "error",
-      duration: 8000,
-    })
-  }
-
-  async #showToast(body: ToastRequest["body"]): Promise<void> {
-    try {
-      const result = await this.#options.client.tui.showToast({ body })
-      if (!result.response.ok || result.error !== undefined) {
-        await this.#options.log.debug({ msg: "advisor toast unavailable", status: result.response.status })
-      }
-    } catch (error) {
-      await this.#options.log.debug({ msg: "advisor toast unavailable", error })
-    }
-  }
-
   async #deliveryFailed(
     sessionID: string,
     queued: QueuedCards,
@@ -243,7 +214,7 @@ export class Deliverer {
     if (queued.attempts < 3) return
     await this.#options.store.removePending(this.#options.directory, ids)
     this.#queued.delete(sessionID)
-    await this.#showToast({
+    await showToast(this.#options.client.tui, this.#options.log, {
       title: "Advisor · warning",
       message: "Advisor card delivery failed - see advisor notes",
       variant: "warning",
