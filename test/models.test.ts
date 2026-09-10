@@ -493,7 +493,7 @@ describe("classifyFailure", () => {
 })
 
 describe("CooldownRegistry and pickModel", () => {
-  const primary = parseModelRef("amazon-bedrock/openai.gpt-5.6-sol:xhigh", ALIASES)
+  const primary = parseModelRef("amazon-bedrock/openai.gpt-5.6-sol:max", ALIASES)
   const fallback = parseModelRef("amazon-bedrock/us.anthropic.claude-fable-5-1:xhigh", ALIASES)
 
   test("returns the primary model when it is available", () => {
@@ -575,7 +575,7 @@ describe("model display names", () => {
         },
       ],
     })
-    const ref = parseModelRef("amazon-bedrock/openai.gpt-5.6-sol:xhigh", ALIASES)
+    const ref = parseModelRef("amazon-bedrock/openai.gpt-5.6-sol:max", ALIASES)
 
     // When
     const result = displayName(ref, catalog)
