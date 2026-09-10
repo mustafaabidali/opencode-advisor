@@ -4,6 +4,7 @@ export type ModelRef = {
   readonly providerID: string
   readonly modelID: string
   readonly variant?: string
+  readonly effort?: string
   readonly long: string
 }
 
@@ -13,6 +14,8 @@ export type ModelAliases = {
 }
 
 export type FailureKind = "throttle" | "auth" | "api" | "content_filter" | "empty"
+
+const REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"] as const
 
 export class ModelRefError extends Error {
   readonly name = "ModelRefError"
@@ -28,23 +31,38 @@ export function parseModelRef(raw: string, aliases: ModelAliases): ModelRef {
   const hasVariant = colon > slash
   const provider = raw.slice(0, slash)
   const modelID = raw.slice(slash + 1, hasVariant ? colon : undefined)
-  const variant = hasVariant ? raw.slice(colon + 1) : undefined
+  const requestedLevel = hasVariant ? raw.slice(colon + 1) : undefined
 
-  if (slash < 1 || modelID.length === 0 || (hasVariant && variant?.length === 0)) {
+  if (slash < 1 || modelID.length === 0 || (hasVariant && requestedLevel?.length === 0)) {
     throw new ModelRefError(raw)
   }
 
   const providerID = aliases.provider_aliases[provider] ?? provider
   const long = `${providerID}/${modelID}`
-  if (variant === undefined) {
+  if (requestedLevel === undefined) {
     return { providerID, modelID, long }
   }
+  const effort = requestedLevel.toLowerCase()
   return {
     providerID,
     modelID,
-    variant: aliases.variant_aliases[variant] ?? variant,
+    variant: aliases.variant_aliases[effort] ?? effort,
+    effort,
     long,
   }
+}
+
+export function reasoningEffortFor(ref: ModelRef): string | undefined {
+  const effort = ref.effort
+  return ref.modelID.includes("gpt-5") &&
+    effort !== undefined &&
+    REASONING_EFFORTS.some((candidate) => candidate === effort)
+    ? effort
+    : undefined
+}
+
+export function displayLevel(ref: ModelRef): string | undefined {
+  return ref.effort ?? ref.variant
 }
 
 export type FailureInput = {

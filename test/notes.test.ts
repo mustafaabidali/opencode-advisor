@@ -301,7 +301,7 @@ describe("renderCard", () => {
   test("renders the exact card with one display model mention and no private ids", () => {
     // Given
     const note: Note = {
-      ...noteInput({ is_fallback: true }),
+      ...noteInput({ is_fallback: true, variant: "max" }),
       id: "20260910-123456-abcdef",
       time: "2026-09-10T12:34:56.000Z",
     }
@@ -311,7 +311,7 @@ describe("renderCard", () => {
 
     // Then
     expect(card).toBe(
-      "Advisor · GPT-5.6 Sol (xhigh) · concern · fallback\n" +
+      "Advisor · GPT-5.6 Sol (max) · concern · fallback\n" +
         "reasoning: The result is inconsistent\n" +
         "note: Fix the shared boundary\n" +
         "evidence: src/a.ts, test/a.test.ts",

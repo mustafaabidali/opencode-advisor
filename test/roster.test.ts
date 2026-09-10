@@ -62,6 +62,7 @@ describe("parseRoster", () => {
       "amazon-bedrock/us.anthropic.claude-fable-5-1",
     ])
     expect(result.advisors.map((entry) => entry.model.variant)).toEqual(["xhigh", "xhigh"])
+    expect(result.advisors.map((entry) => entry.model.effort)).toEqual(["max", "xhigh"])
     expect(result.advisors.map((entry) => entry.tools)).toEqual([
       ["read", "grep", "glob"],
       ["read", "grep", "glob"],

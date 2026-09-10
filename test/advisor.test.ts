@@ -10,7 +10,7 @@ import {
 import { DEFAULTS, type AdvisorConfig } from "../src/config"
 import type { Logger } from "../src/log"
 import { CooldownRegistry } from "../src/models"
-import type { Note, NoteInput, StateSnapshot, TranscriptRecord } from "../src/notes"
+import { renderCard, type Note, type NoteInput, type StateSnapshot, type TranscriptRecord } from "../src/notes"
 import { resolveEntry, type AdvisorEntry } from "../src/roster"
 
 const DIRECTORY = "/workspace/project"
@@ -27,6 +27,10 @@ function entry(name: string): AdvisorEntry {
 
 function entryWithoutFallback(name: string): AdvisorEntry {
   return resolveEntry({ name, fallback: DEFAULTS.default_model }, config())
+}
+
+function maxEffortEntry(name: string): AdvisorEntry {
+  return resolveEntry({ name, model: "bedrock-mantle/openai.gpt-5.6-sol:max" }, config())
 }
 
 function textPart(messageID: string, text: string): Part {
@@ -288,6 +292,34 @@ describe("AdvisorRuntime", () => {
     expect(store.states).toHaveLength(1)
     await subject.runPass("root", "idle", {})
     expect(client.prompts).toHaveLength(2)
+  })
+
+  test("persists and displays the requested model level across advisor records", async () => {
+    // Given
+    const client = new FakeClient()
+    client.promptScripts.push(async () => ({
+      data: assistant('<advice severity="concern">note: Fix the boundary</advice>'),
+      response: { status: 200 },
+    }))
+    const { runtime: subject, store } = runtime({ roster: [maxEffortEntry("Reviewer")], client })
+
+    // When
+    await subject.runPass("root", "idle", {})
+
+    // Then
+    const note = store.notes[0]
+    if (note === undefined) throw new TypeError("expected the advisor note fixture")
+    expect({
+      noteLevel: note.variant,
+      transcriptLevel: store.transcripts[0]?.variant,
+      snapshotLevel: store.states[0]?.advisors[0]?.variant,
+      cardHeader: renderCard(note).split("\n")[0],
+    }).toEqual({
+      noteLevel: "max",
+      transcriptLevel: "max",
+      snapshotLevel: "max",
+      cardHeader: "Advisor · GPT-5.6 Sol (max) · concern",
+    })
   })
 
   test("retries throttle and content-filter failures once with the fallback agent", async () => {

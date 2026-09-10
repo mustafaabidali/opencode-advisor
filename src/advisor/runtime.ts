@@ -3,7 +3,7 @@ import type { Config, Message, Part } from "@opencode-ai/sdk"
 import type { AdvisorConfig } from "../config"
 import { renderDelta, sliceDelta, type Cursor, type TranscriptMessage } from "../delta"
 import { redact, type Logger } from "../log"
-import { displayName, type CooldownRegistry, type ModelCatalog } from "../models"
+import { displayLevel, displayName, type CooldownRegistry, type ModelCatalog } from "../models"
 import type { NoteStore, StateSnapshot, TranscriptOutcome } from "../notes"
 import { ADVISOR_SYSTEM_PROMPT, buildPassPrompt } from "../prompts"
 import {
@@ -225,7 +225,7 @@ export class AdvisorRuntime {
           roster_name: entry.name,
           model: entry.model.long,
           model_display: displayName(entry.model, catalog),
-          variant: entry.model.variant ?? "default",
+          variant: displayLevel(entry.model) ?? "default",
           ...(entry.fallback === undefined ? {} : { fallback: entry.fallback.long }),
           tools: entry.tools,
           enabled: entry.enabled,

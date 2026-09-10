@@ -13,10 +13,12 @@ import {
   buildCatalog,
   classifyFailure,
   CooldownRegistry,
+  displayLevel,
   displayName,
   ModelRefError,
   parseModelRef,
   pickModel,
+  reasoningEffortFor,
 } from "../src/models"
 
 const ALIASES = {
@@ -34,9 +36,9 @@ const CONTENT_FILTER_PATTERNS = [
 ] as const
 
 describe("parseModelRef", () => {
-  test("maps provider and variant aliases", () => {
+  test("maps aliases while preserving the requested level in lowercase", () => {
     // Given
-    const raw = "bedrock-mantle/openai.gpt-5.6-sol:max"
+    const raw = "bedrock-mantle/openai.gpt-5.6-sol:MAX"
 
     // When
     const result = parseModelRef(raw, ALIASES)
@@ -46,6 +48,7 @@ describe("parseModelRef", () => {
       providerID: "amazon-bedrock",
       modelID: "openai.gpt-5.6-sol",
       variant: "xhigh",
+      effort: "max",
       long: "amazon-bedrock/openai.gpt-5.6-sol",
     })
   })
@@ -88,6 +91,46 @@ describe("parseModelRef", () => {
     // Then
     expect(parse).toThrow(ModelRefError)
     expect(parse).toThrow(raw)
+  })
+})
+
+describe("model reasoning effort", () => {
+  test("returns every supported requested level for the gpt-5 family", () => {
+    // Given
+    const levels = ["none", "minimal", "low", "medium", "high", "xhigh", "max"] as const
+
+    // When
+    const efforts = levels.map((level) =>
+      reasoningEffortFor(parseModelRef(`amazon-bedrock/openai.gpt-5.6-sol:${level}`, ALIASES)),
+    )
+
+    // Then
+    expect(efforts).toEqual([...levels])
+  })
+
+  test("does not return reasoning effort for another model family or an unknown level", () => {
+    // Given
+    const anthropic = parseModelRef("amazon-bedrock/us.anthropic.claude-fable-5-1:xhigh", ALIASES)
+    const unknown = parseModelRef("amazon-bedrock/openai.gpt-5.6-sol:extreme", ALIASES)
+
+    // When / Then
+    expect(reasoningEffortFor(anthropic)).toBeUndefined()
+    expect(reasoningEffortFor(unknown)).toBeUndefined()
+  })
+
+  test("displays the requested level before the aliased variant", () => {
+    // Given
+    const requestedMax = parseModelRef("bedrock-mantle/openai.gpt-5.6-sol:max", ALIASES)
+    const legacyVariantOnly = {
+      providerID: "amazon-bedrock",
+      modelID: "openai.gpt-5.6-sol",
+      variant: "xhigh",
+      long: "amazon-bedrock/openai.gpt-5.6-sol",
+    }
+
+    // When / Then
+    expect(displayLevel(requestedMax)).toBe("max")
+    expect(displayLevel(legacyVariantOnly)).toBe("xhigh")
   })
 })
 

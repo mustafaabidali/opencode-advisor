@@ -4,7 +4,7 @@ import type { AdvisorConfig } from "../config"
 import { redact, type Logger } from "../log"
 import {
   classifyFailure,
-  displayName,
+  displayLevel, displayName,
   pickModel,
   type CooldownRegistry,
   type ModelCatalog,
@@ -146,7 +146,7 @@ function transcript({ input, sessionID, model, outcome, result, duration, failur
     advisor_session: sessionID,
     roster_name: input.entry.name,
     model: model.long,
-    variant: model.variant ?? "default",
+    variant: displayLevel(model) ?? "default",
     tokens: result?.info.tokens ?? ZERO_TOKENS,
     cost: result?.info.cost ?? 0,
     duration_ms: duration ?? result?.duration ?? 0,
@@ -171,7 +171,7 @@ async function writeSuccessfulNotes({ input, sessionID, model, isFallback, parts
       provider: model.providerID,
       model: model.long,
       model_display: displayName(model, input.catalog),
-      variant: model.variant ?? "default",
+      variant: displayLevel(model) ?? "default",
       severity: advice.severity,
       reasoning: advice.reasoning,
       note: advice.note,
