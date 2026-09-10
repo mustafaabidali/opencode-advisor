@@ -43,6 +43,7 @@ export type FailureKind =
   | "content_filter"
   | "empty"
   | "timeout"
+  | "poisoned_session"
 
 export type TranscriptTokens = Readonly<{
   input: number

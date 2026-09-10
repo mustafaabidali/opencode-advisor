@@ -3,12 +3,8 @@ import { guardNote, meetsMinSeverity, parseAdvice } from "../advice"
 import type { AdvisorConfig } from "../config"
 import { redact, type Logger } from "../log"
 import {
-  classifyFailure,
-  displayLevel, displayName,
-  pickModel,
-  type CooldownRegistry,
-  type ModelCatalog,
-  type ModelRef,
+  classifyFailure, displayLevel, displayName, pickModel,
+  type CooldownRegistry, type ModelCatalog, type ModelRef,
 } from "../models"
 import type { Note, NoteInput, TranscriptOutcome, TranscriptRecord } from "../notes"
 import type { AdvisorEntry } from "../roster"
@@ -19,9 +15,7 @@ export type ApiResult<Data> = Readonly<{
   response?: Readonly<{ status: number }>
 }>
 
-export type PromptResponse =
-  | Readonly<{ info: AssistantMessage; parts: readonly Part[] }>
-  | AssistantMessage
+export type PromptResponse = Readonly<{ info: AssistantMessage; parts: readonly Part[] }> | AssistantMessage
 
 export type PromptCall = Readonly<{
   path: Readonly<{ id: string }>
@@ -219,7 +213,9 @@ export async function executeAdvisorPass(input: ExecutePassInput): Promise<PassR
         const status = result.kind === "response" && result.info.error?.name === "APIError" ? result.info.error.data.statusCode : thrownStatus
         await input.log.warn({ msg: "advisor attempt failed", advisor: input.entry.slug, model: model.long, agent, failure_kind: failure, ...(status === undefined ? {} : { status }), detail: redact(detail).slice(0, 600) })
       }
-      if (refreshIndex > 0 || result.kind !== "failure" || !(result.error instanceof AdvisorCallError) || result.error.status !== 404) break
+      const missingSession = result.kind === "failure" && result.error instanceof AdvisorCallError && result.error.status === 404
+      if (refreshIndex > 0 || !(missingSession || failure === "poisoned_session")) break
+      if (failure === "poisoned_session") await input.store.appendTranscript(input.watchedID, transcript({ input, sessionID, model, outcome: "error", ...(result.kind === "response" ? { result } : {}), failureKind: failure }))
       sessionID = await input.refreshSession()
     }
     if (result.kind === "timeout") {

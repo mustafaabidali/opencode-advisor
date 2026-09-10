@@ -407,6 +407,39 @@ describe("AdvisorRuntime", () => {
     expect(cooldowns.isCooled(PRIMARY)).toBe(false)
   })
 
+  test("replaces a poisoned child session on the Bedrock reasoning cache-point 400 without cooling the model", async () => {
+    // Given
+    const client = new FakeClient()
+    const poisoned = {
+      name: "APIError" as const,
+      data: {
+        message: "Cache point cannot be inserted after reasoning block. Please remove the invalid cache point and try again.",
+        statusCode: 400,
+        isRetryable: false,
+      },
+    }
+    client.promptScripts.push(
+      async () => ({ data: assistant("", { error: poisoned }), response: { status: 200 } }),
+      async () => ({ data: assistant("<silent/>"), response: { status: 200 } }),
+    )
+    const cooldowns = new CooldownRegistry(() => 1_000)
+    const { runtime: subject, store } = runtime({ client, cooldowns })
+
+    // When
+    const [result] = await subject.runPass("root", "idle", {})
+
+    // Then
+    expect(result?.outcome).toBe("silent")
+    expect(client.creates).toHaveLength(2)
+    expect(client.prompts.map(({ path, body }) => [path.id, body.agent])).toEqual([
+      ["advisor-session-1", "advisor-reviewer"],
+      ["advisor-session-2", "advisor-reviewer"],
+    ])
+    expect(cooldowns.isCooled(PRIMARY)).toBe(false)
+    expect(store.transcripts.map((record) => record.outcome)).toEqual(["error", "silent"])
+    expect(store.transcripts[0]?.failure_kind).toBe("poisoned_session")
+  })
+
   test("recreates a cached child session when prompting it returns 404", async () => {
     // Given
     const client = new FakeClient()

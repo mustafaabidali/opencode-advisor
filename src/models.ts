@@ -13,7 +13,9 @@ export type ModelAliases = {
   readonly variant_aliases: Readonly<Record<string, string>>
 }
 
-export type FailureKind = "throttle" | "auth" | "api" | "content_filter" | "empty"
+export type FailureKind = "throttle" | "auth" | "api" | "content_filter" | "empty" | "poisoned_session"
+
+const POISONED_SESSION = /cache point cannot be inserted after reasoning/i
 
 const REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"] as const
 
@@ -82,6 +84,9 @@ export function classifyFailure(
 ): FailureKind | null {
   const details = failureDetails(input)
   const text = details.text.join("\n")
+  if (details.statusCodes.includes(400) && POISONED_SESSION.test(text)) {
+    return "poisoned_session"
+  }
   const contentFilterStep = input.parts?.some(
     (part) =>
       part.type === "step-finish" &&
