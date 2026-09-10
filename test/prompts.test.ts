@@ -44,6 +44,7 @@ describe("buildPassPrompt", () => {
       watchdogMd: "watchdog priorities",
       entryInstructions: "entry rules",
       originalRequest: "original request",
+      latestRequest: "latest request",
       agentsMd: "agent constraints",
       contextMd: "project context",
       delta: "transcript delta",
@@ -61,6 +62,7 @@ describe("buildPassPrompt", () => {
     )
     const headings = [
       "## Original request",
+      "## Latest user request",
       "## AGENTS.md",
       "## CONTEXT.md",
       "## WATCHDOG.md",
@@ -77,6 +79,7 @@ describe("buildPassPrompt", () => {
     // Given
     const input = {
       originalRequest: `request-${"r".repeat(4_100)}`,
+      latestRequest: `latest-${"l".repeat(4_100)}`,
       agentsMd: `agents-${"a".repeat(6_100)}`,
       contextMd: `context-${"c".repeat(6_100)}`,
       delta: `delta-${"d".repeat(7_000)}`,
@@ -90,7 +93,7 @@ describe("buildPassPrompt", () => {
     // Then
     expect(result).not.toBeNull()
     expect(result).toContain("[… truncated 108 chars …]")
-    expect(result).toContain("[… truncated 107 chars …]")
+    expect(result?.match(/\[… truncated 107 chars …\]/g)).toHaveLength(2)
     expect(result).toContain(input.delta)
   })
 
@@ -113,6 +116,24 @@ describe("buildPassPrompt", () => {
     expect(result).not.toContain("## WATCHDOG.md")
     expect(result).not.toContain("## Roster instructions")
     expect(result).not.toContain("## Advisor instructions")
+  })
+
+  test("omits the latest request section when it equals the original", () => {
+    // Given
+    const input = {
+      originalRequest: "same request",
+      latestRequest: "same request",
+      delta: "transcript delta",
+      passIndex: 2,
+      isFirstPass: false,
+    }
+
+    // When
+    const result = buildPassPrompt(input)
+
+    // Then
+    expect(result).not.toBeNull()
+    expect(result).not.toContain("## Latest user request")
   })
 
   test("returns null when the delta is empty or whitespace", () => {

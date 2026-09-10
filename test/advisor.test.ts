@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import type { AssistantMessage, Config, Message, Part } from "@opencode-ai/sdk"
+import type { AssistantMessage, Config, Part, UserMessage } from "@opencode-ai/sdk"
 
 import {
   AdvisorRuntime,
@@ -33,7 +33,7 @@ function textPart(messageID: string, text: string): Part {
   return { id: `part-${messageID}`, sessionID: "root", messageID, type: "text", text }
 }
 
-function userMessage(id: string, text: string, created = 1): { info: Message; parts: Part[] } {
+function userMessage(id: string, text: string, created = 1): { info: UserMessage; parts: Part[] } {
   return {
     info: {
       id,
@@ -234,6 +234,30 @@ describe("AdvisorRuntime", () => {
     }])
   })
 
+  test("reviews against the latest real user request while retaining the original request", async () => {
+    // Given
+    const client = new FakeClient()
+    const delivery = userMessage("delivery-3", "advisor card", 3)
+    delivery.info.agent = "advisor-delivery"
+    client.messages = [
+      userMessage("user-1", "reply pong", 1),
+      userMessage("user-2", "list the files", 2),
+      delivery,
+      userMessage("adv_synthetic", "ignore synthetic request", 4),
+    ]
+    const { runtime: subject } = runtime({ client })
+
+    // When
+    await subject.runPass("root", "idle", {})
+
+    // Then
+    const prompt = client.prompts[0]?.body.parts.find((part) => part.type === "text")
+    expect(prompt?.text).toContain("## Original request\nreply pong")
+    expect(prompt?.text).toContain("## Latest user request\nlist the files")
+    expect(prompt?.text).not.toContain("## Latest user request\nadvisor card")
+    expect(prompt?.text).not.toContain("## Latest user request\nignore synthetic request")
+  })
+
   test("starts all advisors in parallel, records notes, and advances independent cursors", async () => {
     // Given
     const client = new FakeClient()
@@ -284,6 +308,27 @@ describe("AdvisorRuntime", () => {
     expect(client.prompts[1]?.body.model).toEqual({ providerID: "amazon-bedrock", modelID: "us.anthropic.claude-fable-5-1" })
     expect(store.notes[0]?.is_fallback).toBe(true)
     expect(cooldowns.isCooled(PRIMARY)).toBe(true)
+  })
+
+  test("surfaces the primary model cooldown deadline after fallback succeeds", async () => {
+    // Given
+    const now = 1_000
+    const client = new FakeClient()
+    client.promptScripts.push(
+      async () => ({ error: { message: "provider unavailable" }, response: { status: 500 } }),
+      async () => ({ data: assistant(""), response: { status: 200 } }),
+    )
+    const clock = (): number => now
+    const cooldowns = new CooldownRegistry(clock)
+    const { runtime: subject, store } = runtime({ client, cooldowns, clock })
+
+    // When
+    await subject.runPass("root", "idle", {})
+
+    // Then
+    expect(store.states[0]?.advisors[0]?.cooled_until).toBe(
+      new Date(now + DEFAULTS.fallback_cooldown_ms).toISOString(),
+    )
   })
 
   test("uses the same fallback path for content-filter text", async () => {

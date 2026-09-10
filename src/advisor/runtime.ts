@@ -75,11 +75,7 @@ export class AdvisorRuntime {
     this.options.onAdvisorSession(result.data.id)
     return result.data.id
   }
-  async runPass(
-    watchedID: string,
-    _reason: "step" | "idle",
-    context: RunPassContext = {},
-  ): Promise<PassResult[]> {
+  async runPass(watchedID: string, _reason: "step" | "idle", context: RunPassContext = {}): Promise<PassResult[]> {
     let messages: MessageResponse
     try {
       const response = await this.options.client.session.messages({
@@ -94,14 +90,14 @@ export class AdvisorRuntime {
       await this.options.log.error({ msg: "advisor pass could not fetch messages", watchedID, error })
       return []
     }
-
     this.#watched.add(watchedID)
     const catalog = await this.#catalog()
     const files = await this.#projectFiles()
     const originalRequest = context.firstUserText ?? this.#firstUserText(messages)
+    const latestRequest = this.#latestUserText(messages)
     const settled = await Promise.allSettled(
       this.options.roster.filter(({ enabled }) => enabled).map((entry) =>
-        this.#runEntry(watchedID, entry, messages, originalRequest, catalog, files)),
+        this.#runEntry(watchedID, entry, messages, originalRequest, latestRequest, catalog, files)),
     )
     const results: PassResult[] = []
     for (const result of settled) {
@@ -114,14 +110,9 @@ export class AdvisorRuntime {
     await this.options.store.writeState(this.options.directory, this.#snapshot(catalog))
     return results
   }
-  async #runEntry(
-    watchedID: string,
-    entry: ResolvedEntry,
-    messages: MessageResponse,
-    originalRequest: string,
-    catalog: ModelCatalog,
-    files: Readonly<{ agentsMd?: string; contextMd?: string }>,
-  ): Promise<PassResult | undefined> {
+  async #runEntry(watchedID: string, entry: ResolvedEntry, messages: MessageResponse,
+    originalRequest: string, latestRequest: string | undefined, catalog: ModelCatalog,
+    files: Readonly<{ agentsMd?: string; contextMd?: string }>): Promise<PassResult | undefined> {
     const key = this.#key(watchedID, entry.slug)
     if (this.#inFlight.has(key)) return undefined
     const sliced = sliceDelta(messages satisfies readonly TranscriptMessage[], this.#cursors.get(key) ?? EMPTY_CURSOR)
@@ -129,6 +120,7 @@ export class AdvisorRuntime {
     const stats = this.#stats.get(entry.slug)
     const prompt = buildPassPrompt({
       originalRequest,
+      ...(latestRequest === undefined ? {} : { latestRequest }),
       delta,
       passIndex: (stats?.passes ?? 0) + 1,
       isFirstPass: stats === undefined,
@@ -220,10 +212,14 @@ export class AdvisorRuntime {
   #firstUserText(messages: MessageResponse): string {
     const first = messages.find(({ info }) => info.role === "user"); return first?.parts.filter((part) => part.type === "text").map((part) => part.text).join("\n") ?? ""
   }
+  #latestUserText(messages: MessageResponse): string | undefined {
+    const latest = messages.findLast(({ info }) => info.role === "user" && info.agent !== DELIVERY_AGENT_ID && !info.id.startsWith("adv_")); return latest?.parts.filter((part) => part.type === "text").map((part) => part.text).join("\n")
+  }
   #snapshot(catalog: ModelCatalog): StateSnapshot {
     return {
       advisors: this.options.roster.map((entry) => {
         const stats = this.#stats.get(entry.slug)
+        const cooledUntil = this.options.cooldowns.cooledUntil(entry.model.long)
         return {
           slug: entry.slug,
           roster_name: entry.name,
@@ -233,6 +229,7 @@ export class AdvisorRuntime {
           ...(entry.fallback === undefined ? {} : { fallback: entry.fallback.long }),
           tools: entry.tools,
           enabled: entry.enabled,
+          ...(cooledUntil === undefined ? {} : { cooled_until: new Date(cooledUntil).toISOString() }),
           passes: stats?.passes ?? 0,
           notes: stats?.notes ?? 0,
           cost: stats?.cost ?? 0,
