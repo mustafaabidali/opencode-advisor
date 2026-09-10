@@ -55,8 +55,8 @@ On this machine, the read-only fallback roster is `~/.omp/agent/WATCHDOG.yml`. I
 
 - `bedrock-mantle/` resolves to `amazon-bedrock/` by default.
 - A `:level` suffix is lowercased, retained for cards and status, and passed as the agent variant after `variant_aliases` is applied.
-- `xhigh` is the top native OpenCode variant. The default alias maps `max` to variant `xhigh`.
-- For OpenAI gpt-5 family models, `:max` means variant `xhigh` plus advisor-only `reasoningEffort: max` through `chat.params`. Supported efforts are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`.
+- `variant_aliases` is empty by default, so OpenAI gpt-5 family `:max` stays agent variant `max`.
+- For OpenAI gpt-5 family models, `:max` also sets advisor-only `reasoningEffort: max` through `chat.params`. Supported efforts are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`.
 - Anthropic models don't receive `reasoningEffort`; their top level is `:xhigh`.
 - Tool aliases map `search` to `grep` and `find` to `glob`.
 
@@ -154,7 +154,7 @@ Edit `~/.config/opencode/advisor.jsonc` for global behavior and `<repo>/.opencod
 | `pending_ttl_ms` | `600000` | Maximum pending-card pointer age. |
 | `advise_agents` | `{}` | Child-agent opt-ins, using `true` for the roster or a model ref. |
 | `provider_aliases` | `{"bedrock-mantle":"amazon-bedrock"}` | Accepted provider-prefix rewrites. |
-| `variant_aliases` | `{"max":"xhigh"}` | Requested-level to native-variant rewrites. |
+| `variant_aliases` | `{}` | Optional requested-level to agent-variant rewrites; no rewrites are applied by default. |
 | `content_filter_patterns` | `["content[\\s_-]?filter", "filtering policy", "blocked by", "guardrail", "refusal", "output blocked"]` | Case-insensitive content-filter classifiers. |
 | `quarantine_patterns` | <code>["rm\\s+-rf", "git\\s+push\\s+--force", "--no-verify", "DROP\\s+TABLE", "git\\s+reset\\s+--hard", "chmod\\s+777", "curl[^\\n]*\\&#124;\\s*sh", ":\\(\\)\\s*\\{"]</code> | Destructive text that quarantines a note. |
 | `log_level` | `"info"` | File-log threshold: `debug`, `info`, `warn`, or `error`. |

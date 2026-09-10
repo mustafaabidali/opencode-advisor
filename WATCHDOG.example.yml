@@ -13,7 +13,8 @@ advisors:
     enabled: true
 
     # `model` overrides default_model. The provider alias `bedrock-mantle/`
-    # becomes `amazon-bedrock/`, and the `:max` suffix becomes variant `xhigh`.
+    # becomes `amazon-bedrock/`. With the default empty variant_aliases,
+    # gpt-5 `:max` stays variant `max` and receives reasoningEffort `max`.
     model: bedrock-mantle/openai.gpt-5.6-sol:max
 
     # `fallback` is the single retry model; lists and fallback chains are unsupported.

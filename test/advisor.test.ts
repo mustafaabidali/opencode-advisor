@@ -213,7 +213,7 @@ describe("AdvisorRuntime", () => {
     // Then
     expect(cfg.agent?.["oracle"]).toBe(oracle)
     expect(cfg.agent?.["advisor-reviewer"]?.model).toBe(PRIMARY)
-    expect(cfg.agent?.["advisor-reviewer"]?.["variant"]).toBe("xhigh")
+    expect(cfg.agent?.["advisor-reviewer"]?.["variant"]).toBe("max")
     expect(cfg.agent?.["advisor-reviewer-fb"]?.model).toBe(FALLBACK)
     expect(cfg.agent?.["advisor-delivery"]?.tools?.["bash"]).toBe(true)
     expect(cfg.agent?.["advisor-delivery"]?.permission?.bash).toEqual({

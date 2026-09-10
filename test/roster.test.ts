@@ -61,7 +61,7 @@ describe("parseRoster", () => {
       "amazon-bedrock/openai.gpt-5.6-sol",
       "amazon-bedrock/us.anthropic.claude-fable-5-1",
     ])
-    expect(result.advisors.map((entry) => entry.model.variant)).toEqual(["xhigh", "xhigh"])
+    expect(result.advisors.map((entry) => entry.model.variant)).toEqual(["max", "xhigh"])
     expect(result.advisors.map((entry) => entry.model.effort)).toEqual(["max", "xhigh"])
     expect(result.advisors.map((entry) => entry.tools)).toEqual([
       ["read", "grep", "glob"],
@@ -287,7 +287,7 @@ describe("advisor AgentConfig builders", () => {
       mode: "subagent",
       hidden: true,
       model: "amazon-bedrock/openai.gpt-5.6-sol",
-      variant: "xhigh",
+      variant: "max",
       prompt: "system prompt",
       maxSteps: 12,
       permission: {

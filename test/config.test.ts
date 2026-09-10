@@ -75,7 +75,7 @@ describe("DEFAULTS", () => {
       pending_ttl_ms: 600000,
       advise_agents: {},
       provider_aliases: { "bedrock-mantle": "amazon-bedrock" },
-      variant_aliases: { max: "xhigh" },
+      variant_aliases: {},
       content_filter_patterns: [
         "content[\\s_-]?filter",
         "filtering policy",

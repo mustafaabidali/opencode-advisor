@@ -9,6 +9,7 @@ import type {
 } from "@opencode-ai/sdk"
 
 import { AdvisorCallError } from "../src/advisor/pass"
+import { DEFAULTS } from "../src/config"
 import {
   buildCatalog,
   classifyFailure,
@@ -36,6 +37,18 @@ const CONTENT_FILTER_PATTERNS = [
 ] as const
 
 describe("parseModelRef", () => {
+  test("keeps max as the variant when using the default aliases", () => {
+    // Given
+    const raw = "bedrock-mantle/openai.gpt-5.6-sol:max"
+
+    // When
+    const result = parseModelRef(raw, DEFAULTS)
+
+    // Then
+    expect(result.variant).toBe("max")
+    expect(result.effort).toBe("max")
+  })
+
   test("maps aliases while preserving the requested level in lowercase", () => {
     // Given
     const raw = "bedrock-mantle/openai.gpt-5.6-sol:MAX"

@@ -98,10 +98,9 @@ if [[ ! -e "$CONFIG_FILE" && ! -L "$CONFIG_FILE" ]]; then
     "bedrock-mantle": "amazon-bedrock"
   },
 
-  // Reasoning-level suffixes accepted in WATCHDOG.yml model references.
-  "variant_aliases": {
-    "max": "xhigh"
-  },
+  // Optional reasoning-level to agent-variant rewrites in WATCHDOG.yml.
+  // Empty by default: gpt-5 :max stays variant max and receives reasoningEffort max.
+  "variant_aliases": {},
 
   // Case-insensitive patterns that classify a failed response as content filtering.
   "content_filter_patterns": [

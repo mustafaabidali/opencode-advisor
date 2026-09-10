@@ -68,7 +68,7 @@ The plugin loads `~/.config/opencode/advisor.jsonc`, then overlays `<cwd>/.openc
 | `pending_ttl_ms` | `600000` | Maximum pending-card age before its pointer is discarded. |
 | `advise_agents` | `{}` | Child-agent opt-ins. Map an agent name to `true` for the roster or to a model reference. |
 | `provider_aliases` | `{"bedrock-mantle":"amazon-bedrock"}` | Provider-prefix rewrites accepted in roster model references. |
-| `variant_aliases` | `{"max":"xhigh"}` | Maps requested `:level` suffixes to OpenCode-native agent variants while retaining the requested level. |
+| `variant_aliases` | `{}` | No variant rewrites by default; optionally map requested `:level` suffixes to another agent variant while retaining the requested level. |
 | `content_filter_patterns` | <code>["content[\\s_-]?filter", "filtering policy", "blocked by", "guardrail", "refusal", "output blocked"]</code> | Case-insensitive patterns used to classify content filtering. |
 | `quarantine_patterns` | <code>["rm\\s+-rf", "git\\s+push\\s+--force", "--no-verify", "DROP\\s+TABLE", "git\\s+reset\\s+--hard", "chmod\\s+777", "curl[^\\n]*\\&#124;\\s*sh", ":\\(\\)\\s*\\{"]</code> | Destructive directives that quarantine a note instead of delivering it. |
 | `log_level` | `"info"` | File-log threshold: `debug`, `info`, `warn`, or `error`. |
@@ -98,7 +98,7 @@ The omp-compatible schema is:
 | Entry | `instructions` | Optional | Per-advisor specialization. `prompt` is accepted as an alias. |
 | Entry | `min_severity` | Configured `min_severity` | `nit`, `concern`, or `blocker`. |
 
-Compatibility aliases make the user's omp roster portable: provider prefix `bedrock-mantle/` becomes `amazon-bedrock/`, requested level `:max` becomes the OpenCode agent variant `xhigh`, tool `search` becomes `grep`, and tool `find` becomes `glob`. The raw requested level is lowercased and retained for cards, transcripts, and status. For OpenAI gpt-5 family models, the advisor-only `chat.params` hook also sets `reasoningEffort` for `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`, so `:max` is honoured even though `xhigh` is the top native variant. Anthropic models do not receive that option and top out at `:xhigh`. Unknown tools and malformed fields produce warnings rather than killing the session. Restart OpenCode after editing the roster because agents are registered at startup.
+Compatibility aliases make the user's omp roster portable: provider prefix `bedrock-mantle/` becomes `amazon-bedrock/`, tool `search` becomes `grep`, and tool `find` becomes `glob`. Variant aliases are empty by default, so an OpenAI gpt-5 family `:max` request stays agent variant `max` and the advisor-only `chat.params` hook sets `reasoningEffort: max`; configure `variant_aliases` when a roster needs an explicit variant rewrite. The raw requested level is lowercased and retained for cards, transcripts, and status. Supported gpt-5 efforts are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. Anthropic models do not receive `reasoningEffort` and use `:xhigh` for their top level. Unknown tools and malformed fields produce warnings rather than killing the session. Restart OpenCode after editing the roster because agents are registered at startup.
 
 ## `WATCHDOG.md` priorities
 
