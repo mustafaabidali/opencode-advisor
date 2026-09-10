@@ -9,6 +9,12 @@ import {
 } from "../src/advice"
 
 describe("parseAdvice", () => {
+  test("treats the <silent/> sentinel as zero notes without warnings", () => {
+    // Given / When / Then
+    expect(parseAdvice("<silent/>")).toEqual({ notes: [], warnings: [] })
+    expect(parseAdvice("<silent/>\n")).toEqual({ notes: [], warnings: [] })
+  })
+
   test("parses multiple labelled advice blocks and splits evidence paths", () => {
     // Given
     const text = `preface ignored
