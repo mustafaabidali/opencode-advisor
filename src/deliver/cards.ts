@@ -21,7 +21,7 @@ type ClientResult = Readonly<{
 type ShellRequest = Readonly<{
   path: Readonly<{ id: string }>
   query: Readonly<{ directory: string }>
-  body: Readonly<{ agent: "advisor-delivery"; command: "advisor" }>
+  body: Readonly<{ agent: "advisor-delivery"; command: string }>
 }>
 
 export type DeliveryClient = Readonly<{
@@ -123,48 +123,57 @@ export class Deliverer {
     if (queued === undefined || this.#flushing.has(sessionID)) return
     this.#flushing.add(sessionID)
     this.#lastStatus.set(sessionID, "busy")
-    const ids = queued.notes.map((entry) => entry.id)
-    this.#options.suppress(sessionID, 3000)
     try {
-      const result = await this.#options.client.session.shell({
-        path: { id: sessionID },
-        query: { directory: this.#options.directory },
-        body: { agent: "advisor-delivery", command: "advisor" },
-      })
-      const info =
-        typeof result.data === "object" && result.data !== null && "info" in result.data
-          ? result.data.info
-          : result.data
-      if (!result.response.ok || result.error !== undefined || info === undefined) {
-        await this.#deliveryFailed(sessionID, queued, ids, result.error)
-        return
-      }
-      const messageID =
-        typeof info === "object" && info !== null && "id" in info && typeof info.id === "string"
-          ? info.id
-          : undefined
-      await this.#options.store.markDelivered(ids, new Date(this.#options.clock()).toISOString())
-      await this.#options.log.info({
-        msg: "advisor card delivered",
-        sessionID,
-        noteIDs: ids,
-        ...(messageID === undefined ? {} : { messageID }),
-      })
-      const pendingBlockers = this.#transformer.pendingBlockers.get(sessionID)
-      const clearedBlocker = pendingBlockers?.some((entry) => ids.includes(entry.note.id)) === true
-      this.#transformer.removeDelivered(sessionID, ids)
-      if (clearedBlocker) {
-        await this.#options.log.info({
-          msg: "blocker cleared after card",
-          sessionID,
-          noteIDs: ids,
-        })
+      for (let current = queued.notes[0]; current !== undefined; current = queued.notes[0]) {
+        this.#options.suppress(sessionID, 3000)
+        const messageID = await this.#shell(sessionID, current)
+        queued.notes.shift()
+        await this.#recordDelivered(sessionID, current, messageID)
       }
       this.#queued.delete(sessionID)
     } catch (error) {
-      await this.#deliveryFailed(sessionID, queued, ids, error)
+      await this.#deliveryFailed(sessionID, queued, error)
     } finally {
       this.#flushing.delete(sessionID)
+    }
+  }
+
+  async #shell(sessionID: string, note: Note): Promise<string | undefined> {
+    const result = await this.#options.client.session.shell({
+      path: { id: sessionID },
+      query: { directory: this.#options.directory },
+      body: { agent: "advisor-delivery", command: `advisor --note ${note.id}` },
+    })
+    const info =
+      typeof result.data === "object" && result.data !== null && "info" in result.data
+        ? result.data.info
+        : result.data
+    if (!result.response.ok || result.error !== undefined || info === undefined) {
+      throw result.error ?? new Error(`advisor shell returned ${result.response.status}`)
+    }
+    return typeof info === "object" && info !== null && "id" in info && typeof info.id === "string"
+      ? info.id
+      : undefined
+  }
+
+  async #recordDelivered(sessionID: string, note: Note, messageID: string | undefined): Promise<void> {
+    const pendingBlockers = this.#transformer.pendingBlockers.get(sessionID)
+    const clearedBlocker = pendingBlockers?.some((entry) => entry.note.id === note.id) === true
+    this.#transformer.removeDelivered(sessionID, [note.id])
+    try {
+      await this.#options.store.markDelivered([note.id], new Date(this.#options.clock()).toISOString())
+    } catch (error) {
+      await this.#options.log.warn({ msg: "advisor card bookkeeping failed", sessionID, noteIDs: [note.id], error })
+      return
+    }
+    await this.#options.log.info({
+      msg: "advisor card delivered",
+      sessionID,
+      noteIDs: [note.id],
+      ...(messageID === undefined ? {} : { messageID }),
+    })
+    if (clearedBlocker) {
+      await this.#options.log.info({ msg: "blocker cleared after card", sessionID, noteIDs: [note.id] })
     }
   }
 
@@ -198,12 +207,7 @@ export class Deliverer {
     }
   }
 
-  async #deliveryFailed(
-    sessionID: string,
-    queued: QueuedCards,
-    ids: readonly string[],
-    error: unknown,
-  ): Promise<void> {
+  async #deliveryFailed(sessionID: string, queued: QueuedCards, error: unknown): Promise<void> {
     queued.attempts += 1
     await this.#options.log.warn({
       msg: "advisor card delivery failed",
@@ -212,6 +216,7 @@ export class Deliverer {
       error,
     })
     if (queued.attempts < 3) return
+    const ids = queued.notes.map((entry) => entry.id)
     await this.#options.store.removePending(this.#options.directory, ids)
     this.#queued.delete(sessionID)
     await showToast(this.#options.client.tui, this.#options.log, {

@@ -195,6 +195,34 @@ describe("NoteStore pending queue", () => {
     ).toEqual([])
   })
 
+  test("claims only the requested note id and leaves other pointers pending", async () => {
+    // Given
+    const dataDir = await temporaryDataDir()
+    const firstStore = fixedStore(dataDir, { time: "2026-09-10T12:00:00.000Z" })
+    const first = await firstStore.writeNote(noteInput())
+    const secondStore = fixedStore(dataDir, {
+      time: "2026-09-10T12:01:00.000Z",
+      random: 1 / 0x1000000,
+    })
+    const second = await secondStore.writeNote(noteInput())
+    await secondStore.enqueuePending("/workspace/project", [first.id, second.id])
+
+    // When
+    const claimed = await secondStore.claimPending("/workspace/project", {
+      ttlMs: 600_000,
+      noteID: second.id,
+    })
+
+    // Then
+    expect(claimed.map(({ id }) => id)).toEqual([second.id])
+    expect(await readdir(join(dataDir, "pending", cwdKey("/workspace/project")))).toEqual([
+      `${first.id}.json`,
+    ])
+    expect(
+      await secondStore.claimPending("/workspace/project", { ttlMs: 600_000, noteID: "missing" }),
+    ).toEqual([])
+  })
+
   test("does not return a note whose pointer another claimant already renamed", async () => {
     // Given
     const dataDir = await temporaryDataDir()

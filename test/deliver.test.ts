@@ -84,6 +84,7 @@ type Harness = Readonly<{
     : never
   suppressed: Array<Readonly<{ sessionID: string; milliseconds: number }>>
   infos: LogFields[]
+  warns: LogFields[]
   store: DelivererOptions["store"]
 }>
 
@@ -97,6 +98,7 @@ function makeHarness(
     shellStatuses?: readonly number[]
     shellThrows?: boolean
     shellEnvelope?: boolean
+    markDeliveredThrows?: boolean
   }> = {},
 ): Harness {
   const calls: string[] = []
@@ -104,6 +106,7 @@ function makeHarness(
   const toastBodies: Harness["toastBodies"] = []
   const suppressed: Harness["suppressed"] = []
   const infos: LogFields[] = []
+  const warns: LogFields[] = []
   const pending = new Set<string>()
   const shellStatuses = [...(options.shellStatuses ?? [200])]
   const store = {
@@ -113,6 +116,7 @@ function makeHarness(
     },
     markDelivered: async (ids, _at) => {
       calls.push("delivered")
+      if (options.markDeliveredThrows === true) throw new Error("disk full")
       for (const id of ids) pending.delete(id)
     },
     removePending: async (_cwd, ids) => {
@@ -153,7 +157,7 @@ function makeHarness(
   const log: Logger = {
     debug: async () => undefined,
     info: async (fields) => { infos.push(fields) },
-    warn: async () => undefined,
+    warn: async (fields) => { warns.push(fields) },
     error: async () => undefined,
   }
   return {
@@ -162,6 +166,7 @@ function makeHarness(
     toastBodies,
     suppressed,
     infos,
+    warns,
     store,
     deliverer: new Deliverer({
       config: {
@@ -210,15 +215,98 @@ describe("Deliverer cards and notifications", () => {
       {
         msg: "advisor card delivered",
         sessionID: "root-1",
-        noteIDs: ["block-1", "c-1"],
+        noteIDs: ["block-1"],
         messageID: "shell-assistant",
       },
       {
         msg: "blocker cleared after card",
         sessionID: "root-1",
-        noteIDs: ["block-1", "c-1"],
+        noteIDs: ["block-1"],
+      },
+      {
+        msg: "advisor card delivered",
+        sessionID: "root-1",
+        noteIDs: ["c-1"],
+        messageID: "shell-assistant",
       },
     ])
+  })
+
+  test("ships each note as its own shell block, sequentially, suppressing before each shell", async () => {
+    // Given
+    const harness = makeHarness({ toast: false })
+    await status(harness.deliverer, "idle")
+
+    // When
+    await harness.deliverer.deliver("root-1", [note("a-1"), note("b-2", "nit")])
+
+    // Then
+    expect(harness.shellCalls.map((call) => call.body.command)).toEqual([
+      "advisor --note a-1",
+      "advisor --note b-2",
+    ])
+    expect(harness.calls.filter((call) => call === "shell" || call === "delivered")).toEqual([
+      "shell",
+      "delivered",
+      "shell",
+      "delivered",
+    ])
+    expect(harness.suppressed).toEqual([
+      { sessionID: "root-1", milliseconds: 3000 },
+      { sessionID: "root-1", milliseconds: 3000 },
+    ])
+  })
+
+  test("never re-shells a shown card when bookkeeping fails after a successful shell", async () => {
+    // Given
+    const harness = makeHarness({ toast: false, markDeliveredThrows: true })
+    await status(harness.deliverer, "idle")
+
+    // When
+    await harness.deliverer.deliver("root-1", [note("block-1", "blocker"), note("n-2")])
+    await status(harness.deliverer, "idle")
+    await status(harness.deliverer, "idle")
+
+    // Then
+    expect(harness.shellCalls.map((call) => call.body.command)).toEqual([
+      "advisor --note block-1",
+      "advisor --note n-2",
+    ])
+    expect(harness.calls.filter((call) => call === "removed")).toHaveLength(0)
+    expect(harness.deliverer.pendingBlockers.get("root-1") ?? []).toEqual([])
+    expect(harness.warns.map((warn) => warn["msg"])).toEqual([
+      "advisor card bookkeeping failed",
+      "advisor card bookkeeping failed",
+    ])
+  })
+
+  test("keeps only the unshipped notes queued when a later shell in the batch fails", async () => {
+    // Given
+    const harness = makeHarness({ toast: false, shellStatuses: [200, 500, 200] })
+    await status(harness.deliverer, "idle")
+
+    // When
+    await harness.deliverer.deliver("root-1", [note("a-1"), note("b-2")])
+
+    // Then
+    expect(harness.shellCalls.map((call) => call.body.command)).toEqual([
+      "advisor --note a-1",
+      "advisor --note b-2",
+    ])
+    expect(harness.infos.filter((info) => info["msg"] === "advisor card delivered")).toEqual([
+      { msg: "advisor card delivered", sessionID: "root-1", noteIDs: ["a-1"], messageID: "shell-assistant" },
+    ])
+
+    // When
+    await status(harness.deliverer, "idle")
+
+    // Then
+    expect(harness.shellCalls.map((call) => call.body.command)).toEqual([
+      "advisor --note a-1",
+      "advisor --note b-2",
+      "advisor --note b-2",
+    ])
+    expect(harness.calls.filter((call) => call === "removed")).toHaveLength(0)
   })
 
   test("queues blockers, emits severity toasts, and aborts only when opted in", async () => {
@@ -258,7 +346,7 @@ describe("Deliverer cards and notifications", () => {
       {
         path: { id: "root-1" },
         query: { directory: "/workspace/project" },
-        body: { agent: "advisor-delivery", command: "advisor" },
+        body: { agent: "advisor-delivery", command: "advisor --note n-1" },
       },
     ])
     expect(harness.calls.indexOf("enqueue")).toBeLessThan(harness.calls.indexOf("shell"))

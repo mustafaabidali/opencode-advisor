@@ -124,6 +124,34 @@ describe("advisor CLI", () => {
     expect(second.stdout.toString()).toBe("Advisor · no pending notes\n")
   })
 
+  test("prints only the requested card with --note and leaves the rest pending", async () => {
+    // Given
+    const { project, xdg, store } = await fixture()
+    const firstNote = await store.writeNote(noteInput(project))
+    const secondStore = new NoteStore({
+      dataDir: join(xdg, "opencode-advisor"),
+      log: silentLog,
+      clock: () => new Date(Date.parse(firstNote.time) + 1_000),
+      random: () => 1 / 0x1000000,
+    })
+    const secondNote = await secondStore.writeNote({ ...noteInput(project), severity: "nit" })
+    await store.enqueuePending(project, [firstNote.id, secondNote.id])
+
+    // When
+    const targeted = runCli(project, xdg, ["--note", secondNote.id])
+    const repeat = runCli(project, xdg, ["--note", secondNote.id])
+    const remaining = runCli(project, xdg)
+    const missingID = runCli(project, xdg, ["--note"])
+
+    // Then
+    expect(targeted.exitCode).toBe(0)
+    expect(targeted.stdout.toString()).toBe(`${renderCard(secondNote)}\n`)
+    expect(repeat.stdout.toString()).toBe("Advisor · no pending notes\n")
+    expect(remaining.stdout.toString()).toBe(`${renderCard(firstNote)}\n`)
+    expect(missingID.exitCode).toBe(2)
+    expect(missingID.stdout.toString()).toBe("")
+  })
+
   test("keeps the default command successful when a pending note is corrupt", async () => {
     // Given
     const { project, xdg } = await fixture()
@@ -265,7 +293,7 @@ describe("advisor CLI", () => {
     expect(result.exitCode).toBe(2)
     expect(result.stdout.toString()).toBe("")
     expect(result.stderr.toString()).toBe(
-      "Usage: advisor [status [--json] | notes [--last N] [--json] | --version]\n",
+      "Usage: advisor [--note <id> | status [--json] | notes [--last N] [--json] | --version]\n",
     )
   })
 

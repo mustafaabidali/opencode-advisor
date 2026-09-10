@@ -80,26 +80,21 @@ export class NoteStore {
     }
   }
 
-  async claimPending(cwd: string, options: Readonly<{ ttlMs: number }>): Promise<Note[]> {
+  async claimPending(
+    cwd: string,
+    options: Readonly<{ ttlMs: number; noteID?: string }>,
+  ): Promise<Note[]> {
     for (const candidate of this.#cwdParents(cwd)) {
-      const claimed = await this.#claimKey(this.#cwdKey(candidate), options.ttlMs)
+      const claimed = await this.#claimKey(this.#cwdKey(candidate), options)
       if (claimed.length > 0) return claimed
     }
     const newest = await this.#newestPendingKey()
-    return newest === undefined ? [] : this.#claimKey(newest, options.ttlMs)
+    return newest === undefined ? [] : this.#claimKey(newest, options)
   }
 
   async removePending(cwd: string, noteIDs: readonly string[]): Promise<void> {
     const directory = join(this.#dataDir, "pending", this.#cwdKey(cwd))
-    await Promise.all(
-      noteIDs.map(async (noteID) => {
-        try {
-          await rm(join(directory, `${noteID}.json`))
-        } catch (error) {
-          if (!isMissingFile(error)) throw error
-        }
-      }),
-    )
+    await Promise.all(noteIDs.map((id) => rm(join(directory, `${id}.json`), { force: true })))
   }
 
   async markDelivered(noteIDs: readonly string[], at: string): Promise<void> {
@@ -157,12 +152,17 @@ export class NoteStore {
       .slice(0, options.last)
   }
 
-  async #claimKey(key: string, ttlMs: number): Promise<Note[]> {
-    const pointers = await this.#readPointers(key)
+  async #claimKey(
+    key: string,
+    options: Readonly<{ ttlMs: number; noteID?: string }>,
+  ): Promise<Note[]> {
+    const pointers = (await this.#readPointers(key)).filter(
+      (located) => options.noteID === undefined || located.pointer.noteID === options.noteID,
+    )
     const claimed: Note[] = []
     for (const located of pointers.sort((a, b) => a.pointer.time.localeCompare(b.pointer.time))) {
       const source = join(this.#dataDir, "pending", key, located.name)
-      if (this.#clock().getTime() - Date.parse(located.pointer.time) > ttlMs) {
+      if (this.#clock().getTime() - Date.parse(located.pointer.time) > options.ttlMs) {
         await rm(source, { force: true })
         await this.#log.warn({
           msg: "discarding stale pending pointer",

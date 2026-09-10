@@ -88,16 +88,22 @@ if (command === "--version") {
     )
     console.log(["time | severity | model display | note", ...rows].join("\n"))
   }
-} else if (command === undefined) {
+} else if (command === undefined || (command === "--note" && process.argv[3] !== undefined)) {
+  const noteID = process.argv[3]
   let notes: Note[] = []
   try {
-    notes = await store.claimPending(cwd, { ttlMs: config.pending_ttl_ms })
+    notes = await store.claimPending(cwd, {
+      ttlMs: config.pending_ttl_ms,
+      ...(noteID === undefined ? {} : { noteID }),
+    })
   } catch (error) {
     // no-excuse-ok: catch - this command runs inside chat and must always exit successfully.
     await log.error({ msg: "unable to claim pending notes", error })
   }
   console.log(notes.length === 0 ? "Advisor · no pending notes" : notes.map(renderCard).join("\n\n"))
 } else {
-  console.error("Usage: advisor [status [--json] | notes [--last N] [--json] | --version]")
+  console.error(
+    "Usage: advisor [--note <id> | status [--json] | notes [--last N] [--json] | --version]",
+  )
   process.exitCode = 2
 }
