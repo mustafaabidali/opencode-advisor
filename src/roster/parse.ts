@@ -198,7 +198,7 @@ export function defaultRoster(config: RosterConfig): ParsedRoster {
   if (entry === undefined) {
     return {
       advisors: [],
-      warnings: ["No roster file and no default_model configured; no advisors will run"],
+      warnings: ["No usable roster entries and no default_model configured; no advisors will run"],
     }
   }
   const warnings = entry.fallback === undefined && config.default_fallback !== undefined

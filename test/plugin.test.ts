@@ -365,6 +365,40 @@ describe("advisor plugin entry", () => {
     }
   })
 
+  test("logs why no advisor runs when the roster file yields no usable entries and no default_model is set", async () => {
+    // Given
+    const plugin = await loadPlugin()
+    expect(plugin).toBeDefined()
+    if (plugin === undefined) return
+    const harness = await makeHarness({
+      exists: (path) => path.endsWith("WATCHDOG.yml"),
+      readFile: async (path) => {
+        if (path.endsWith("WATCHDOG.yml")) return "advisors:\n  - name: Implicit\n"
+        if (path.endsWith("advisor.jsonc")) return "{}"
+        return readFile(path, "utf8")
+      },
+    })
+
+    try {
+      // When
+      await plugin.createAdvisorHooks(
+        { client: new FakeClient(), directory: harness.directory },
+        harness.dependencies,
+      )
+
+      // Then
+      const rosterWarnings = harness.logs
+        .filter(({ level, fields }) => level === "warn" && fields["source"] === "roster")
+        .map(({ fields }) => fields["warning"])
+      expect(rosterWarnings).toEqual([
+        'Advisor "Implicit" has no model and no default_model is configured; skipped',
+        "No usable roster entries and no default_model configured; no advisors will run",
+      ])
+    } finally {
+      await removeHarness(harness.temporaryRoot)
+    }
+  })
+
   test("returns empty hooks instead of rejecting when startup fails", async () => {
     // Given
     const plugin = await loadPlugin()

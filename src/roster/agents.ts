@@ -56,9 +56,11 @@ function resolveFallback(
   config: RosterConfig,
 ): ModelRef | undefined {
   const candidates =
-    input.fallback === undefined
-      ? [config.default_fallback, config.default_model]
-      : [input.fallback]
+    input.fallback !== undefined
+      ? [input.fallback]
+      : config.default_fallback === undefined
+        ? []
+        : [config.default_fallback, config.default_model]
   for (const candidate of candidates) {
     if (candidate === undefined) continue
     const ref = parseModelRef(candidate, config)

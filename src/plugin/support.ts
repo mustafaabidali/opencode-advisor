@@ -137,10 +137,13 @@ export async function loadResolvedRoster({
     }
   }
 
+  if (parsed.advisors.length === 0) {
+    const fallback = defaultRoster(config)
+    parsed = { ...fallback, warnings: [...parsed.warnings, ...fallback.warnings] }
+  }
   for (const warning of parsed.warnings) {
     await log.warn({ msg: "advisor startup warning", source: "roster", warning })
   }
-  if (parsed.advisors.length === 0) parsed = defaultRoster(config)
   const watchdogMd = await readWatchdogMarkdown(files.md, dependencies, log)
   return parsed.advisors.map((entry) => ({
     ...entry,

@@ -181,7 +181,7 @@ describe("roster defaults and identity", () => {
     // Then
     expect(result.advisors).toEqual([])
     expect(result.warnings).toEqual([
-      "No roster file and no default_model configured; no advisors will run",
+      "No usable roster entries and no default_model configured; no advisors will run",
     ])
     expect(resolveEntry({ name: "Unset", enabled: true }, DEFAULTS)).toBeUndefined()
   })
@@ -248,6 +248,23 @@ describe("roster defaults and identity", () => {
     expect(implicit?.fallback?.variant).toBe("max")
     expect(implicit?.fallbackAgentId).toBe("advisor-fable-fb")
     expect(explicit?.fallback).toBeUndefined()
+  })
+
+  test("gives no implicit fallback when default_fallback is unset, even with a default_model", () => {
+    // Given
+    const config = { ...DEFAULTS, default_model: "amazon-bedrock/openai.gpt-5.6-sol:max" }
+
+    // When
+    const entry = resolveEntry(
+      { name: "Fable", enabled: true, model: "amazon-bedrock/us.anthropic.claude-fable-5-1:xhigh" },
+      config,
+    )
+    const roster = parseRoster("advisors:\n  - name: Fable\n    model: provider/other:high\n", config)
+
+    // Then
+    expect(entry?.fallback).toBeUndefined()
+    expect(entry?.fallbackAgentId).toBeUndefined()
+    expect(roster.warnings).toEqual([])
   })
 })
 
