@@ -11,10 +11,13 @@ LOCAL_BIN="$HOME_DIR/.local/bin"
 CLI_LINK="$LOCAL_BIN/advisor"
 CONFIG_FILE="$OPENCODE_DIR/advisor.jsonc"
 COMMAND_FILE="$OPENCODE_DIR/command/advisor.md"
+SKILLS_DIR="$OPENCODE_DIR/skills"
+SKILL_SOURCE="/Users/mustafa/opencode-advisor/skills/opencode-advisor"
+SKILL_LINK="$SKILLS_DIR/opencode-advisor"
 
 (cd "$REPO_ROOT" && bun install)
 
-mkdir -p "$OPENCODE_DIR/plugins" "$OPENCODE_DIR/command" "$LOCAL_BIN"
+mkdir -p "$OPENCODE_DIR/plugins" "$OPENCODE_DIR/command" "$SKILLS_DIR" "$LOCAL_BIN"
 
 if [[ -e "$PLUGIN_LINK" && ! -L "$PLUGIN_LINK" ]]; then
   printf 'refusing to replace non-symlink plugin: %s\n' "$PLUGIN_LINK" >&2
@@ -29,6 +32,13 @@ if [[ -e "$CLI_LINK" && ! -L "$CLI_LINK" ]]; then
 fi
 ln -sfn "$REPO_ROOT/bin/advisor.ts" "$CLI_LINK"
 printf 'installed advisor CLI symlink\n'
+
+if [[ -e "$SKILL_LINK" && ! -L "$SKILL_LINK" ]]; then
+  printf 'refusing to replace non-symlink skill: %s\n' "$SKILL_LINK" >&2
+  exit 1
+fi
+ln -sfn "$SKILL_SOURCE" "$SKILL_LINK"
+printf 'installed skill symlink: %s -> %s\n' "$SKILL_LINK" "$SKILL_SOURCE"
 
 case ":${PATH:-}:" in
   *":$LOCAL_BIN:"*) ;;

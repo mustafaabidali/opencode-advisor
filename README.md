@@ -27,20 +27,24 @@ From this repository:
 bash scripts/install.sh
 ```
 
-The installer is idempotent. It runs `bun install`, links `src/plugin.ts` directly to `~/.config/opencode/plugins/advisor.ts`, links `bin/advisor.ts` to `~/.local/bin/advisor`, and warns when `~/.local/bin` is not in the current `PATH`. It does not create an `/opt/homebrew/bin` link. It creates these files only when absent:
+The installer is idempotent. It runs `bun install`, links `src/plugin.ts` directly to `~/.config/opencode/plugins/advisor.ts`, links `bin/advisor.ts` to `~/.local/bin/advisor`, links `skills/opencode-advisor` to `~/.config/opencode/skills/opencode-advisor`, and warns when `~/.local/bin` is not in the current `PATH`. It does not create an `/opt/homebrew/bin` link. It creates these files only when absent:
 
 - `~/.config/opencode/advisor.jsonc`
 - `~/.config/opencode/command/advisor.md`
 
-Existing user-edited copies are left untouched. Quit and restart OpenCode after installation so it loads the plugin and `/advisor` command.
+Existing user-edited copies are left untouched. Quit and restart OpenCode after installation so it loads the plugin, `/advisor` command, and skill.
 
-To remove only the two symlinks:
+To remove only the three symlinks:
 
 ```sh
 bash scripts/uninstall.sh
 ```
 
 Uninstall leaves configuration, notes, transcripts, state, and logs in place.
+
+## Skill
+
+The bundled [`opencode-advisor` skill](skills/opencode-advisor/SKILL.md) teaches agents and users how to interpret cards, inspect state, configure reviewers, troubleshoot failures, and modify the plugin. The installer exposes it through `~/.config/opencode/skills/opencode-advisor`; restart OpenCode after installing or changing it.
 
 ## `advisor.jsonc` reference
 
