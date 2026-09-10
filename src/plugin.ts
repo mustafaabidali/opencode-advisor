@@ -6,7 +6,7 @@ import { AdvisorRuntime } from "./advisor"
 import { loadConfig, resolveDataDir } from "./config"
 import { Deliverer } from "./deliver"
 import { createLogger, type Logger } from "./log"
-import { CooldownRegistry, displayName, reasoningEffortFor } from "./models"
+import { CooldownRegistry, displayName } from "./models"
 import { NoteStore } from "./notes"
 import {
   adaptPluginClient,
@@ -174,22 +174,6 @@ export async function createAdvisorHooks(
       "chat.message": safe(log, "chat.message", async (chatInput, output) => {
         if (chatInput.agent?.startsWith("advisor-") === true) return
         watcher.handleChatMessage(chatInput, output)
-      }),
-      "chat.params": safe(log, "chat.params", async (chatInput, output) => {
-        const entry = roster.find(({ agentId, fallbackAgentId, enabled }) =>
-          enabled && (agentId === chatInput.agent || fallbackAgentId === chatInput.agent))
-        if (entry === undefined) return
-        const ref = entry.agentId === chatInput.agent ? entry.model : entry.fallback
-        if (ref === undefined) return
-        const effort = reasoningEffortFor(ref)
-        if (effort === undefined) return
-        output.options["reasoningEffort"] = effort
-        await log.info({
-          msg: "advisor reasoning effort applied",
-          agent: chatInput.agent,
-          model: ref.long,
-          effort,
-        })
       }),
       "experimental.chat.messages.transform": safe(
         log,

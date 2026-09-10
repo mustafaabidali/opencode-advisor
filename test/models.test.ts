@@ -19,7 +19,6 @@ import {
   ModelRefError,
   parseModelRef,
   pickModel,
-  reasoningEffortFor,
 } from "../src/models"
 
 const ALIASES = {
@@ -108,29 +107,6 @@ describe("parseModelRef", () => {
 })
 
 describe("model reasoning effort", () => {
-  test("returns every supported requested level for the gpt-5 family", () => {
-    // Given
-    const levels = ["none", "minimal", "low", "medium", "high", "xhigh", "max"] as const
-
-    // When
-    const efforts = levels.map((level) =>
-      reasoningEffortFor(parseModelRef(`amazon-bedrock/openai.gpt-5.6-sol:${level}`, ALIASES)),
-    )
-
-    // Then
-    expect(efforts).toEqual([...levels])
-  })
-
-  test("does not return reasoning effort for another model family or an unknown level", () => {
-    // Given
-    const anthropic = parseModelRef("amazon-bedrock/us.anthropic.claude-fable-5-1:xhigh", ALIASES)
-    const unknown = parseModelRef("amazon-bedrock/openai.gpt-5.6-sol:extreme", ALIASES)
-
-    // When / Then
-    expect(reasoningEffortFor(anthropic)).toBeUndefined()
-    expect(reasoningEffortFor(unknown)).toBeUndefined()
-  })
-
   test("displays the requested level before the aliased variant", () => {
     // Given
     const requestedMax = parseModelRef("bedrock-mantle/openai.gpt-5.6-sol:max", ALIASES)
@@ -597,7 +573,7 @@ describe("model display names", () => {
     expect(result).toBe("GPT-5.6 Sol")
   })
 
-  test("strips known vendor prefixes when the catalog has no name", () => {
+  test("falls back to the raw model id when the catalog has no name", () => {
     // Given
     const catalog = buildCatalog({ providers: [] })
     const openAI = parseModelRef("amazon-bedrock/openai.gpt-5.6-sol", ALIASES)
@@ -608,7 +584,7 @@ describe("model display names", () => {
     const anthropicName = displayName(anthropic, catalog)
 
     // Then
-    expect(openAIName).toBe("gpt-5.6-sol")
-    expect(anthropicName).toBe("claude-fable-5-1")
+    expect(openAIName).toBe("openai.gpt-5.6-sol")
+    expect(anthropicName).toBe("us.anthropic.claude-fable-5-1")
   })
 })

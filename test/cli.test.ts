@@ -200,7 +200,7 @@ describe("advisor CLI", () => {
     expect(result.exitCode).toBe(0)
     expect(result.stdout.toString()).toBe(
       "slug | model display (variant) | fallback display | tools | enabled | cooled until | passes | notes | cost\n" +
-        "reviewer | GPT-5.6 Sol (xhigh) | claude-fable-5-1 | read, grep, glob | true | 2026-09-10T13:00:00.000Z | 3 | 1 | 0.42\n" +
+        "reviewer | GPT-5.6 Sol (xhigh) | us.anthropic.claude-fable-5-1 | read, grep, glob | true | 2026-09-10T13:00:00.000Z | 3 | 1 | 0.42\n" +
         "watched sessions | root-1\n" +
         "updated_at | 2026-09-10T12:34:56.000Z\n",
     )

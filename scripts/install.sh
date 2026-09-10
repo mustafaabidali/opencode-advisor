@@ -51,11 +51,13 @@ if [[ ! -e "$CONFIG_FILE" && ! -L "$CONFIG_FILE" ]]; then
   // Master switch. OPENCODE_ADVISOR_ENABLED=0 temporarily disables the plugin.
   "enabled": true,
 
-  // Default reviewer model. Sol at max mirrors the user's omp advisor role.
-  "default_model": "amazon-bedrock/openai.gpt-5.6-sol:max",
+  // Reviewer model for roster entries that omit `model`, as `<provider>/<model-id>[:level]`.
+  // The plugin ships no model of its own: with this unset, every roster entry must name one.
+  // "default_model": "<provider>/<model-id>:<level>",
 
-  // One fallback only. Fable 5.1 at xhigh mirrors the user's omp fallback role.
-  "default_fallback": "amazon-bedrock/us.anthropic.claude-fable-5-1:xhigh",
+  // Single retry model for entries that omit `fallback`. Unset means no retry unless the
+  // entry sets one; an entry whose inherited fallback is its own model retries on default_model.
+  // "default_fallback": "<provider>/<other-model-id>:<level>",
 
   // Lowest severity delivered: "nit", "concern", or "blocker".
   "min_severity": "nit",
@@ -98,8 +100,8 @@ if [[ ! -e "$CONFIG_FILE" && ! -L "$CONFIG_FILE" ]]; then
     "bedrock-mantle": "amazon-bedrock"
   },
 
-  // Optional reasoning-level to agent-variant rewrites in WATCHDOG.yml.
-  // Empty by default: gpt-5 :max stays variant max and receives reasoningEffort max.
+  // Optional rewrites from a requested `:level` to the agent variant OpenCode receives.
+  // Empty by default: the level is passed through as the variant unchanged.
   "variant_aliases": {},
 
   // Case-insensitive patterns that classify a failed response as content filtering.

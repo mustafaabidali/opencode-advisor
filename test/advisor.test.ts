@@ -17,20 +17,34 @@ const DIRECTORY = "/workspace/project"
 const PRIMARY = "amazon-bedrock/openai.gpt-5.6-sol"
 const FALLBACK = "amazon-bedrock/us.anthropic.claude-fable-5-1"
 
+const DEFAULT_MODEL = "amazon-bedrock/openai.gpt-5.6-sol:max"
+
 function config(overrides: Partial<AdvisorConfig> = {}): AdvisorConfig {
-  return { ...DEFAULTS, pass_timeout_ms: 100, ...overrides }
+  return {
+    ...DEFAULTS,
+    default_model: DEFAULT_MODEL,
+    default_fallback: `${FALLBACK}:xhigh`,
+    pass_timeout_ms: 100,
+    ...overrides,
+  }
+}
+
+function resolved(input: Parameters<typeof resolveEntry>[0]): AdvisorEntry {
+  const entry = resolveEntry(input, config())
+  if (entry === undefined) throw new Error("fixture entry must resolve")
+  return entry
 }
 
 function entry(name: string): AdvisorEntry {
-  return resolveEntry({ name }, config())
+  return resolved({ name })
 }
 
 function entryWithoutFallback(name: string): AdvisorEntry {
-  return resolveEntry({ name, fallback: DEFAULTS.default_model }, config())
+  return resolved({ name, fallback: DEFAULT_MODEL })
 }
 
 function maxEffortEntry(name: string): AdvisorEntry {
-  return resolveEntry({ name, model: "bedrock-mantle/openai.gpt-5.6-sol:max" }, config())
+  return resolved({ name, model: "bedrock-mantle/openai.gpt-5.6-sol:max" })
 }
 
 function textPart(messageID: string, text: string): Part {

@@ -17,8 +17,6 @@ export type FailureKind = "throttle" | "auth" | "api" | "content_filter" | "empt
 
 const POISONED_SESSION = /cache point cannot be inserted after reasoning/i
 
-const REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"] as const
-
 export class ModelRefError extends Error {
   readonly name = "ModelRefError"
 
@@ -52,15 +50,6 @@ export function parseModelRef(raw: string, aliases: ModelAliases): ModelRef {
     effort,
     long,
   }
-}
-
-export function reasoningEffortFor(ref: ModelRef): string | undefined {
-  const effort = ref.effort
-  return ref.modelID.includes("gpt-5") &&
-    effort !== undefined &&
-    REASONING_EFFORTS.some((candidate) => candidate === effort)
-    ? effort
-    : undefined
 }
 
 export function displayLevel(ref: ModelRef): string | undefined {
@@ -182,14 +171,7 @@ export function buildCatalog(response: {
 }
 
 export function displayName(ref: ModelRef, catalog: ModelCatalog): string {
-  const catalogName = catalog.get(ref.long)
-  if (catalogName !== undefined) {
-    return catalogName
-  }
-  const modelID = ref.modelID.startsWith(`${ref.providerID}/`)
-    ? ref.modelID.slice(ref.providerID.length + 1)
-    : ref.modelID
-  return modelID.replace(/^(?:us\.anthropic\.|anthropic\.|openai\.)/, "")
+  return catalog.get(ref.long) ?? ref.modelID
 }
 
 type FailureDetails = {

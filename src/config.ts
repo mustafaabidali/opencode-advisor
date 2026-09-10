@@ -8,8 +8,8 @@ export type AdvisorLogLevel = "debug" | "info" | "warn" | "error"
 export type ConfigEnvironment = Readonly<Record<string, string | undefined>>
 export type AdvisorConfig = Readonly<{
   enabled: boolean
-  default_model: string
-  default_fallback: string
+  default_model?: string
+  default_fallback?: string
   min_severity: AdvisorSeverity
   toast: boolean
   abort_on_blocker: boolean
@@ -38,8 +38,6 @@ export type LoadConfigOptions = Readonly<{
 
 export const DEFAULTS = {
   enabled: true,
-  default_model: "amazon-bedrock/openai.gpt-5.6-sol:max",
-  default_fallback: "amazon-bedrock/us.anthropic.claude-fable-5-1:xhigh",
   min_severity: "nit",
   toast: true,
   abort_on_blocker: false,

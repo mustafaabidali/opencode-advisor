@@ -2,6 +2,18 @@ import { describe, expect, test } from "bun:test"
 import { join } from "node:path"
 
 import { DEFAULTS } from "../src/config"
+
+const CONFIG = {
+  ...DEFAULTS,
+  default_model: "amazon-bedrock/openai.gpt-5.6-sol:max",
+  default_fallback: "amazon-bedrock/us.anthropic.claude-fable-5-1:xhigh",
+}
+
+function resolved(input: Parameters<typeof resolveEntry>[0], config = CONFIG) {
+  const entry = resolveEntry(input, config)
+  if (entry === undefined) throw new Error("fixture entry must resolve")
+  return entry
+}
 import {
   DELIVERY_AGENT_ID,
   KNOWN_BUILTINS,
@@ -51,7 +63,7 @@ function propertyValue(object: object | undefined, key: string): unknown {
 describe("parseRoster", () => {
   test("accepts the user's omp roster verbatim", () => {
     // Given / When
-    const result = parseRoster(REAL_WATCHDOG, DEFAULTS)
+    const result = parseRoster(REAL_WATCHDOG, CONFIG)
 
     // Then
     expect(result.instructions).toContain("Review the primary agent independently")
@@ -70,7 +82,9 @@ describe("parseRoster", () => {
     expect(result.advisors[0]?.fallback?.long).toBe(
       "amazon-bedrock/us.anthropic.claude-fable-5-1",
     )
-    expect(result.advisors[1]?.fallback).toBeUndefined()
+    expect(result.advisors[1]?.fallback?.long).toBe("amazon-bedrock/openai.gpt-5.6-sol")
+    expect(result.advisors[1]?.fallback?.variant).toBe("max")
+    expect(result.warnings).toEqual([])
   })
 
   test("drops a later duplicate name with a warning", () => {
@@ -80,7 +94,7 @@ describe("parseRoster", () => {
   - name: Duplicate`
 
     // When
-    const result = parseRoster(text, DEFAULTS)
+    const result = parseRoster(text, CONFIG)
 
     // Then
     expect(result.advisors).toHaveLength(1)
@@ -95,7 +109,7 @@ describe("parseRoster", () => {
     min_severity: blocker`
 
     // When
-    const result = parseRoster(text, DEFAULTS)
+    const result = parseRoster(text, CONFIG)
 
     // Then
     expect(result.advisors[0]?.enabled).toBeTrue()
@@ -111,7 +125,7 @@ describe("parseRoster", () => {
     fallback: [provider/c, provider/d]`
 
     // When
-    const result = parseRoster(text, DEFAULTS)
+    const result = parseRoster(text, CONFIG)
 
     // Then
     expect(result.advisors[0]?.model.long).toBe("amazon-bedrock/openai.gpt-5.6-sol")
@@ -126,7 +140,7 @@ describe("parseRoster", () => {
 
   test("returns zero advisors and a warning for invalid YAML", () => {
     // Given / When
-    const result = parseRoster("advisors:\n  - name: [", DEFAULTS)
+    const result = parseRoster("advisors:\n  - name: [", CONFIG)
 
     // Then
     expect(result.advisors).toEqual([])
@@ -135,7 +149,7 @@ describe("parseRoster", () => {
 
   test("returns zero advisors when advisors is not a list", () => {
     // Given / When
-    const result = parseRoster("advisors: invalid", DEFAULTS)
+    const result = parseRoster("advisors: invalid", CONFIG)
 
     // Then
     expect(result.advisors).toEqual([])
@@ -152,12 +166,42 @@ describe("roster defaults and identity", () => {
 
   test("builds one enabled default advisor", () => {
     // Given / When
-    const result = defaultRoster(DEFAULTS)
+    const result = defaultRoster(CONFIG)
 
     // Then
     expect(result.advisors).toHaveLength(1)
     expect(result.advisors[0]?.name).toBe("Advisor")
     expect(result.advisors[0]?.enabled).toBeTrue()
+  })
+
+  test("ships no model of its own: without default_model there is no default advisor", () => {
+    // Given / When
+    const result = defaultRoster(DEFAULTS)
+
+    // Then
+    expect(result.advisors).toEqual([])
+    expect(result.warnings).toEqual([
+      "No roster file and no default_model configured; no advisors will run",
+    ])
+    expect(resolveEntry({ name: "Unset", enabled: true }, DEFAULTS)).toBeUndefined()
+  })
+
+  test("skips a roster entry that names no model when default_model is unset", () => {
+    // Given
+    const text = `advisors:
+  - name: Explicit
+    model: provider/model:high
+  - name: Implicit`
+
+    // When
+    const result = parseRoster(text, DEFAULTS)
+
+    // Then
+    expect(result.advisors.map((entry) => entry.name)).toEqual(["Explicit"])
+    expect(result.advisors[0]?.fallback).toBeUndefined()
+    expect(result.warnings).toEqual([
+      'Advisor "Implicit" has no model and no default_model is configured; skipped',
+    ])
   })
 
   test("drops a fallback that resolves to the primary model", () => {
@@ -172,8 +216,38 @@ describe("roster defaults and identity", () => {
     const entry = resolveEntry({ name: "Same model", enabled: true }, config)
 
     // Then
-    expect(entry.fallback).toBeUndefined()
-    expect(entry.fallbackAgentId).toBeUndefined()
+    expect(entry?.fallback).toBeUndefined()
+    expect(entry?.fallbackAgentId).toBeUndefined()
+  })
+
+  test("falls back to default_model when the implicit default_fallback is the entry's own model", () => {
+    // Given
+    const config = {
+      ...DEFAULTS,
+      default_model: "amazon-bedrock/openai.gpt-5.6-sol:max",
+      default_fallback: "amazon-bedrock/us.anthropic.claude-fable-5-1:xhigh",
+    }
+
+    // When
+    const implicit = resolveEntry(
+      { name: "Fable", enabled: true, model: "amazon-bedrock/us.anthropic.claude-fable-5-1:xhigh" },
+      config,
+    )
+    const explicit = resolveEntry(
+      {
+        name: "Fable explicit",
+        enabled: true,
+        model: "amazon-bedrock/us.anthropic.claude-fable-5-1:xhigh",
+        fallback: "amazon-bedrock/us.anthropic.claude-fable-5-1:xhigh",
+      },
+      config,
+    )
+
+    // Then
+    expect(implicit?.fallback?.long).toBe("amazon-bedrock/openai.gpt-5.6-sol")
+    expect(implicit?.fallback?.variant).toBe("max")
+    expect(implicit?.fallbackAgentId).toBe("advisor-fable-fb")
+    expect(explicit?.fallback).toBeUndefined()
   })
 })
 
@@ -272,10 +346,7 @@ describe("advisor AgentConfig builders", () => {
 
   test("grants requested mutation tools and asks for edit and bash permission", () => {
     // Given
-    const entry = resolveEntry(
-      { name: "Editor", enabled: true, tools: ["edit", "bash"] },
-      DEFAULTS,
-    )
+    const entry = resolved({ name: "Editor", enabled: true, tools: ["edit", "bash"] })
 
     // When
     const config = toAgentConfig(entry, "system prompt")
@@ -308,10 +379,7 @@ describe("advisor AgentConfig builders", () => {
 
   test("allows only granted investigative permissions after the catch-all deny", () => {
     // Given
-    const entry = resolveEntry(
-      { name: "Reader", enabled: true, tools: ["read", "grep", "glob"] },
-      DEFAULTS,
-    )
+    const entry = resolved({ name: "Reader", enabled: true, tools: ["read", "grep", "glob"] })
 
     // When
     const config = toAgentConfig(entry, "system prompt")
@@ -325,7 +393,7 @@ describe("advisor AgentConfig builders", () => {
 
   test("turns every built-in off for an explicit empty grant", () => {
     // Given
-    const entry = resolveEntry({ name: "No tools", enabled: true, tools: [] }, DEFAULTS)
+    const entry = resolved({ name: "No tools", enabled: true, tools: [] })
 
     // When
     const config = toAgentConfig(entry, "system prompt")
@@ -336,7 +404,7 @@ describe("advisor AgentConfig builders", () => {
 
   test("uses the fallback model and variant for the fallback agent config", () => {
     // Given
-    const entry = resolveEntry({ name: "Reviewer", enabled: true }, DEFAULTS)
+    const entry = resolved({ name: "Reviewer", enabled: true })
 
     // When
     const config = toFallbackAgentConfig(entry, "system prompt")

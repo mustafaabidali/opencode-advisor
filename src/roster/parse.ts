@@ -163,7 +163,11 @@ function parsedRoster(value: unknown, config: RosterConfig): ParsedRoster {
     const input = inputEntry(valueEntry, index, context)
     if (input === undefined) continue
     const entry = resolveEntry(input, config)
-    if (entry.fallback === undefined) {
+    if (entry === undefined) {
+      warnings.push(`Advisor "${input.name}" has no model and no default_model is configured; skipped`)
+      continue
+    }
+    if (entry.fallback === undefined && (input.fallback ?? config.default_fallback) !== undefined) {
       warnings.push(`Advisor "${entry.name}" fallback matches its model and was dropped`)
     }
     advisors.push(entry)
@@ -191,7 +195,13 @@ export function parseRoster(text: string, config: RosterConfig): ParsedRoster {
 
 export function defaultRoster(config: RosterConfig): ParsedRoster {
   const entry = resolveEntry({ name: "Advisor", enabled: true }, config)
-  const warnings = entry.fallback === undefined
+  if (entry === undefined) {
+    return {
+      advisors: [],
+      warnings: ["No roster file and no default_model configured; no advisors will run"],
+    }
+  }
+  const warnings = entry.fallback === undefined && config.default_fallback !== undefined
     ? [`Advisor "${entry.name}" fallback matches its model and was dropped`]
     : []
   return { advisors: [entry], warnings }

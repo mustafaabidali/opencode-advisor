@@ -4,13 +4,11 @@ import { mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-import type { Hooks, ProviderContext } from "@opencode-ai/plugin"
 import type {
   AssistantMessage,
   EventSessionCreated,
   EventSessionStatus,
   Message,
-  Model,
   Part,
   Session,
   UserMessage,
@@ -23,23 +21,6 @@ const NOW = 1_789_000_000_000
 const ROOT_ID = "root-session"
 const ROOT_SENTINEL = "ROOT_REQUEST_SENTINEL"
 const ADVISOR_SENTINEL = "ADVISOR_MESSAGE_SENTINEL"
-const SOL_AGENT = "advisor-reviewer-gpt-5-6-sol-max"
-const FABLE_AGENT = "advisor-reviewer-claude-fable-5-1-xhigh"
-const EFFORT_ROSTER = `advisors:
-  - name: Reviewer (GPT-5.6 Sol:max)
-    model: bedrock-mantle/openai.gpt-5.6-sol:max
-  - name: Reviewer (Claude Fable 5.1:xhigh)
-    model: amazon-bedrock/us.anthropic.claude-fable-5-1:xhigh`
-
-type ChatParamsInput = Parameters<NonNullable<Hooks["chat.params"]>>[0]
-type ChatParamsOutput = Readonly<{
-  temperature: number
-  topP: number
-  topK: number
-  maxOutputTokens: number | undefined
-  options: Record<string, unknown>
-}>
-
 type PromptProbe = Readonly<{
   body: Readonly<{
     parts: readonly [Readonly<{ type: "text"; text: string }>]
@@ -247,61 +228,13 @@ function chatOutput(text: string): Readonly<{ message: UserMessage; parts: Part[
   return { message: transcript.info, parts: [...transcript.parts] }
 }
 
-function modelFixture(): Model {
-  return {
-    id: "openai.gpt-5.6-sol",
-    providerID: "amazon-bedrock",
-    api: { id: "bedrock", url: "https://example.invalid", npm: "@ai-sdk/amazon-bedrock" },
-    name: "GPT-5.6 Sol",
-    capabilities: {
-      temperature: true,
-      reasoning: true,
-      attachment: false,
-      toolcall: true,
-      input: { text: true, audio: false, image: false, video: false, pdf: false },
-      output: { text: true, audio: false, image: false, video: false, pdf: false },
-    },
-    cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
-    limit: { context: 1, output: 1 },
-    status: "active",
-    options: {},
-    headers: {},
-  }
-}
+const HARNESS_CONFIG = JSON.stringify({
+  default_model: "amazon-bedrock/openai.gpt-5.6-sol:max",
+  default_fallback: "amazon-bedrock/us.anthropic.claude-fable-5-1:xhigh",
+})
 
-function providerFixture(): ProviderContext {
-  return {
-    source: "config",
-    info: {
-      id: "amazon-bedrock",
-      name: "Amazon Bedrock",
-      source: "config",
-      env: [],
-      options: {},
-      models: {},
-    },
-    options: {},
-  }
-}
-
-function chatParamsInput(agent: string): ChatParamsInput {
-  return {
-    sessionID: ROOT_ID,
-    agent,
-    model: modelFixture(),
-    provider: providerFixture(),
-    message: chatOutput("review this").message,
-  }
-}
-
-function chatParamsOutput(): ChatParamsOutput {
-  return {
-    temperature: 0.7,
-    topP: 0.9,
-    topK: 40,
-    maxOutputTokens: 4096,
-    options: { existing: "preserved" },
-  }
+function harnessReadFile(path: string): Promise<string> {
+  return path.endsWith("advisor.jsonc") ? Promise.resolve(HARNESS_CONFIG) : readFile(path, "utf8")
 }
 
 async function makeHarness(overrides: DependencyOverrides = {}) {
@@ -322,7 +255,7 @@ async function makeHarness(overrides: DependencyOverrides = {}) {
     dependencies: {
       home,
       environment,
-      readFile: overrides.readFile ?? ((path: string) => readFile(path, "utf8")),
+      readFile: overrides.readFile ?? harnessReadFile,
       exists: overrides.exists ?? existsSync,
       clock: () => NOW,
       timers: new FakeTimers(),
@@ -344,7 +277,7 @@ async function until(predicate: () => boolean): Promise<void> {
 }
 
 describe("advisor plugin entry", () => {
-  test("returns exactly the seven coexistence-safe hooks", async () => {
+  test("returns exactly the six coexistence-safe hooks", async () => {
     // Given
     const plugin = await loadPlugin()
     expect(plugin).toBeDefined()
@@ -361,7 +294,6 @@ describe("advisor plugin entry", () => {
       // Then
       expect(Object.keys(hooks).sort()).toEqual([
         "chat.message",
-        "chat.params",
         "config",
         "event",
         "experimental.chat.messages.transform",
@@ -410,7 +342,7 @@ describe("advisor plugin entry", () => {
       exists: (path) => path.endsWith("WATCHDOG.yml"),
       readFile: async (path) => {
         if (path.endsWith("WATCHDOG.yml")) throw new Error("EACCES roster")
-        return readFile(path, "utf8")
+        return harnessReadFile(path)
       },
     })
 
@@ -422,7 +354,7 @@ describe("advisor plugin entry", () => {
       )
 
       // Then
-      expect(Object.keys(hooks)).toHaveLength(7)
+      expect(Object.keys(hooks)).toHaveLength(6)
       expect(
         harness.logs.some(
           ({ level, fields }) => level === "warn" && fields["source"] === "roster",
@@ -491,106 +423,6 @@ describe("advisor plugin entry", () => {
       const prompt = client.promptCalls[0]?.body.parts[0].text ?? ""
       expect(prompt).toContain(ROOT_SENTINEL)
       expect(prompt).not.toContain(ADVISOR_SENTINEL)
-    } finally {
-      await removeHarness(harness.temporaryRoot)
-    }
-  })
-
-  test("leaves chat parameters untouched for a non-advisor agent", async () => {
-    // Given
-    const plugin = await loadPlugin()
-    expect(plugin).toBeDefined()
-    if (plugin === undefined) return
-    const harness = await makeHarness()
-
-    try {
-      const hooks = await plugin.createAdvisorHooks(
-        { client: new FakeClient(), directory: harness.directory },
-        harness.dependencies,
-      )
-      const chatParams = hooks["chat.params"]
-      expect(chatParams).toBeDefined()
-      if (chatParams === undefined) return
-      const output = chatParamsOutput()
-
-      // When
-      await chatParams(chatParamsInput("build"), output)
-
-      // Then
-      expect(output).toEqual(chatParamsOutput())
-    } finally {
-      await removeHarness(harness.temporaryRoot)
-    }
-  })
-
-  test("applies max reasoning effort only to the matching gpt-5 advisor agent", async () => {
-    // Given
-    const plugin = await loadPlugin()
-    expect(plugin).toBeDefined()
-    if (plugin === undefined) return
-    const harness = await makeHarness({
-      exists: (path) => path.endsWith("WATCHDOG.yml"),
-      readFile: async (path) => path.endsWith("WATCHDOG.yml") ? EFFORT_ROSTER : readFile(path, "utf8"),
-    })
-
-    try {
-      const hooks = await plugin.createAdvisorHooks(
-        { client: new FakeClient(), directory: harness.directory },
-        harness.dependencies,
-      )
-      const chatParams = hooks["chat.params"]
-      expect(chatParams).toBeDefined()
-      if (chatParams === undefined) return
-      const output = chatParamsOutput()
-
-      // When
-      await chatParams(chatParamsInput(SOL_AGENT), output)
-
-      // Then
-      expect(output).toEqual({
-        ...chatParamsOutput(),
-        options: { existing: "preserved", reasoningEffort: "max" },
-      })
-      expect(harness.logs).toContainEqual({
-        level: "info",
-        fields: {
-          msg: "advisor reasoning effort applied",
-          agent: SOL_AGENT,
-          model: "amazon-bedrock/openai.gpt-5.6-sol",
-          effort: "max",
-        },
-      })
-    } finally {
-      await removeHarness(harness.temporaryRoot)
-    }
-  })
-
-  test("does not apply reasoning effort to the matching anthropic advisor agent", async () => {
-    // Given
-    const plugin = await loadPlugin()
-    expect(plugin).toBeDefined()
-    if (plugin === undefined) return
-    const harness = await makeHarness({
-      exists: (path) => path.endsWith("WATCHDOG.yml"),
-      readFile: async (path) => path.endsWith("WATCHDOG.yml") ? EFFORT_ROSTER : readFile(path, "utf8"),
-    })
-
-    try {
-      const hooks = await plugin.createAdvisorHooks(
-        { client: new FakeClient(), directory: harness.directory },
-        harness.dependencies,
-      )
-      const chatParams = hooks["chat.params"]
-      expect(chatParams).toBeDefined()
-      if (chatParams === undefined) return
-      const output = chatParamsOutput()
-
-      // When
-      await chatParams(chatParamsInput(FABLE_AGENT), output)
-
-      // Then
-      expect(output).toEqual(chatParamsOutput())
-      expect(harness.logs.some(({ fields }) => fields["msg"] === "advisor reasoning effort applied")).toBe(false)
     } finally {
       await removeHarness(harness.temporaryRoot)
     }

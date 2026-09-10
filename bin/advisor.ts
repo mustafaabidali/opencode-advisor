@@ -48,10 +48,7 @@ if (command === "--version") {
     console.log(JSON.stringify(snapshot))
   } else {
     const rows = snapshot.advisors.map((advisor) => {
-      const fallback = advisor.fallback
-        ?.split("/")
-        .at(-1)
-        ?.replace(/^(?:us\.anthropic\.|anthropic\.|openai\.)/, "") ?? "-"
+      const fallback = advisor.fallback?.split("/").at(-1) ?? "-"
       return [
         advisor.slug,
         `${advisor.model_display} (${advisor.variant})`,

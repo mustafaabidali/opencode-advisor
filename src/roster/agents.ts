@@ -50,16 +50,31 @@ export function normalizeTools(tools?: readonly string[]): NormalizedTools {
   return { granted, warnings }
 }
 
+function resolveFallback(
+  input: RosterAdvisorInput,
+  model: ModelRef,
+  config: RosterConfig,
+): ModelRef | undefined {
+  const candidates =
+    input.fallback === undefined
+      ? [config.default_fallback, config.default_model]
+      : [input.fallback]
+  for (const candidate of candidates) {
+    if (candidate === undefined) continue
+    const ref = parseModelRef(candidate, config)
+    if (ref.long !== model.long) return ref
+  }
+  return undefined
+}
+
 export function resolveEntry(
   input: RosterAdvisorInput,
   config: RosterConfig,
-): AdvisorEntry {
-  const model = parseModelRef(input.model ?? config.default_model, config)
-  const candidateFallback = parseModelRef(
-    input.fallback ?? config.default_fallback,
-    config,
-  )
-  const fallback = candidateFallback.long === model.long ? undefined : candidateFallback
+): AdvisorEntry | undefined {
+  const rawModel = input.model ?? config.default_model
+  if (rawModel === undefined) return undefined
+  const model = parseModelRef(rawModel, config)
+  const fallback = resolveFallback(input, model, config)
   const tools = normalizeTools(input.tools).granted
   const instructions = input.instructions ?? input.prompt
   const slug = slugify(input.name)
