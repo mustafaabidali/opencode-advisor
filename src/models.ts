@@ -52,7 +52,7 @@ export type FailureInput = {
   readonly info?: {
     readonly error?: {
       readonly name: string
-      readonly data?: { readonly message?: string; readonly statusCode?: number }
+      readonly data?: { readonly message?: string; readonly statusCode?: number; readonly responseBody?: string }
     }
   }
   readonly parts?: readonly Part[]
@@ -85,7 +85,7 @@ export function classifyFailure(
     return "auth"
   }
   if (
-    details.names.some((name) => /^apierror$/i.test(name)) ||
+    details.names.some((name) => /^(?:apierror|unknownerror|messageoutputlengtherror|messageabortederror)$/i.test(name)) ||
     details.statusCodes.some((status) => status >= 500)
   ) {
     return "api"
@@ -195,6 +195,7 @@ function collectFailure(value: unknown, depth: number, result: FailureAccumulato
     result.text.push(value.name)
   }
   if ("message" in value && typeof value.message === "string") result.text.push(value.message)
+  if ("responseBody" in value && typeof value.responseBody === "string") result.text.push(value.responseBody)
   if ("statusCode" in value && typeof value.statusCode === "number") result.statusCodes.push(value.statusCode)
   if ("status" in value && typeof value.status === "number") result.statusCodes.push(value.status)
   if ("detail" in value) collectFailure(value.detail, depth + 1, result)

@@ -1,5 +1,12 @@
 import { describe, expect, test } from "bun:test"
-import type { Part } from "@opencode-ai/sdk"
+import type {
+  ApiError,
+  MessageAbortedError,
+  MessageOutputLengthError,
+  Part,
+  ProviderAuthError,
+  UnknownError,
+} from "@opencode-ai/sdk"
 
 import { AdvisorCallError } from "../src/advisor/pass"
 import {
@@ -182,7 +189,7 @@ describe("classifyFailure", () => {
     // Given
     const input = {
       info: {
-        error: { name: "UnknownError", data: { message: "generation ended" } },
+        error: { name: "SyntheticEmptyError", data: { message: "generation ended" } },
       },
       parts: [],
     }
@@ -286,6 +293,152 @@ describe("classifyFailure", () => {
     const error = new AdvisorCallError("advisor prompt failed", undefined, {
       name: "UnknownError",
       data: { message: "provider returned an unrelated failure" },
+    })
+
+    // When
+    const result = classifyFailure({ thrown: error }, CONTENT_FILTER_PATTERNS)
+
+    // Then
+    expect(result).toBe("api")
+  })
+
+  test("classifies an exact SDK APIError content-filter message", () => {
+    // Given
+    const error = {
+      name: "APIError",
+      data: {
+        message: "Output blocked by content filtering policy",
+        isRetryable: false,
+      },
+    } satisfies ApiError
+
+    // When
+    const result = classifyFailure({ info: { error } }, CONTENT_FILTER_PATTERNS)
+
+    // Then
+    expect(result).toBe("content_filter")
+  })
+
+  test("classifies guardrail text in an exact SDK APIError responseBody", () => {
+    // Given
+    const error = {
+      name: "APIError",
+      data: {
+        message: "Unexpected server error",
+        isRetryable: false,
+        responseBody: '{"message":"Bedrock guardrail intervened"}',
+      },
+    } satisfies ApiError
+
+    // When
+    const result = classifyFailure({ info: { error } }, CONTENT_FILTER_PATTERNS)
+
+    // Then
+    expect(result).toBe("content_filter")
+  })
+
+  test("classifies status 429 in an exact SDK APIError as throttling", () => {
+    // Given
+    const error = {
+      name: "APIError",
+      data: {
+        message: "request failed",
+        statusCode: 429,
+        isRetryable: true,
+      },
+    } satisfies ApiError
+
+    // When
+    const result = classifyFailure({ info: { error } }, CONTENT_FILTER_PATTERNS)
+
+    // Then
+    expect(result).toBe("throttle")
+  })
+
+  test("classifies throttling text in an exact SDK APIError", () => {
+    // Given
+    const error = {
+      name: "APIError",
+      data: {
+        message: "ThrottlingException: Rate exceeded",
+        isRetryable: true,
+      },
+    } satisfies ApiError
+
+    // When
+    const result = classifyFailure({ info: { error } }, CONTENT_FILTER_PATTERNS)
+
+    // Then
+    expect(result).toBe("throttle")
+  })
+
+  test("classifies an exact SDK ProviderAuthError as authentication failure", () => {
+    // Given
+    const error = {
+      name: "ProviderAuthError",
+      data: {
+        providerID: "amazon-bedrock",
+        message: "credentials rejected",
+      },
+    } satisfies ProviderAuthError
+
+    // When
+    const result = classifyFailure({ info: { error } }, CONTENT_FILTER_PATTERNS)
+
+    // Then
+    expect(result).toBe("auth")
+  })
+
+  test("classifies an exact SDK UnknownError with a generic message as API failure", () => {
+    // Given
+    const error = {
+      name: "UnknownError",
+      data: { message: "Unexpected server error" },
+    } satisfies UnknownError
+
+    // When
+    const result = classifyFailure({ info: { error } }, CONTENT_FILTER_PATTERNS)
+
+    // Then
+    expect(result).toBe("api")
+  })
+
+  test("classifies an exact SDK MessageOutputLengthError as API failure", () => {
+    // Given
+    const error = {
+      name: "MessageOutputLengthError",
+      data: {},
+    } satisfies MessageOutputLengthError
+
+    // When
+    const result = classifyFailure({ info: { error } }, CONTENT_FILTER_PATTERNS)
+
+    // Then
+    expect(result).toBe("api")
+  })
+
+  test("classifies an exact SDK MessageAbortedError as API failure", () => {
+    // Given
+    const error = {
+      name: "MessageAbortedError",
+      data: { message: "Message generation aborted" },
+    } satisfies MessageAbortedError
+
+    // When
+    const result = classifyFailure({ info: { error } }, CONTENT_FILTER_PATTERNS)
+
+    // Then
+    expect(result).toBe("api")
+  })
+
+  test("keeps a generic UnknownError detail as API failure when no pattern matches", () => {
+    // Given
+    const error = new AdvisorCallError("advisor prompt failed", undefined, {
+      name: "UnknownError",
+      data: {
+        message: "Unexpected server error. Check server logs for details.",
+        ref: "err_x",
+      },
     })
 
     // When

@@ -169,6 +169,7 @@ function runtime(options: Readonly<{
   timers?: AdvisorTimers
   clock?: () => number
   warnings?: string[]
+  logger?: Logger
 }> = {}): { runtime: AdvisorRuntime; client: FakeClient; store: MemoryStore } {
   const client = options.client ?? new FakeClient()
   const store = options.store ?? new MemoryStore()
@@ -179,7 +180,7 @@ function runtime(options: Readonly<{
       catalog: new Map([[PRIMARY, "GPT-5.6 Sol"], [FALLBACK, "Claude Fable"]]),
       cooldowns: options.cooldowns ?? new CooldownRegistry(options.clock),
       store,
-      log,
+      log: options.logger ?? log,
       client,
       directory: DIRECTORY,
       clock: options.clock ?? (() => 1_000),
@@ -486,5 +487,42 @@ describe("AdvisorRuntime", () => {
     expect(first.map(({ outcome }) => outcome)).toContain("silent")
     expect(second).toHaveLength(1)
     expect(client.prompts).toHaveLength(3)
+  })
+
+  test("logs a redacted failed-attempt detail when the prompt rejects", async () => {
+    // Given
+    const client = new FakeClient()
+    const secret = `sk-${"a".repeat(24)}`
+    const scriptedMessage = `scripted provider failure ${secret} ${"x".repeat(700)}`
+    client.promptScripts.push(async () => { throw new Error(scriptedMessage) })
+    const warnCalls: Parameters<Logger["warn"]>[0][] = []
+    const fakeLogger: Logger = {
+      ...log,
+      warn: async (fields) => { warnCalls.push(fields) },
+    }
+    const { runtime: subject } = runtime({
+      roster: [entryWithoutFallback("Reviewer")],
+      client,
+      logger: fakeLogger,
+    })
+
+    // When
+    await subject.runPass("root", "idle", {})
+
+    // Then
+    expect(warnCalls).toHaveLength(1)
+    expect(warnCalls[0]).toMatchObject({
+      msg: "advisor attempt failed",
+      advisor: "reviewer",
+      model: PRIMARY,
+      agent: "advisor-reviewer",
+      failure_kind: "api",
+    })
+    const detail = warnCalls[0]?.["detail"]
+    if (typeof detail !== "string") throw new TypeError("expected failed-attempt detail to be a string")
+    expect(detail).toContain("scripted provider failure")
+    expect(detail).toContain("[REDACTED]")
+    expect(detail).not.toContain(secret)
+    expect(detail).toHaveLength(600)
   })
 })

@@ -1,8 +1,7 @@
 import type { AssistantMessage, Part } from "@opencode-ai/sdk"
-
 import { guardNote, meetsMinSeverity, parseAdvice } from "../advice"
 import type { AdvisorConfig } from "../config"
-import type { Logger } from "../log"
+import { redact, type Logger } from "../log"
 import {
   classifyFailure,
   displayName,
@@ -201,18 +200,32 @@ export async function executeAdvisorPass(input: ExecutePassInput): Promise<PassR
   let isFallback = selected.isFallback
   let agent = isFallback ? (input.entry.fallbackAgentId ?? `${input.entry.agentId}-fb`) : input.entry.agentId
   for (let attemptIndex = 0; attemptIndex < 2; attemptIndex += 1) {
-    let result = await attempt({ input, sessionID, model, agent })
-    if (result.kind === "failure" && result.error instanceof AdvisorCallError && result.error.status === 404) {
-      sessionID = await input.refreshSession()
+    let result: AttemptResult
+    let failure: ReturnType<typeof classifyFailure>
+    for (let refreshIndex = 0; ; refreshIndex += 1) {
       result = await attempt({ input, sessionID, model, agent })
+      failure = result.kind === "failure"
+        ? classifyFailure({ thrown: result.error }, input.config.content_filter_patterns) ?? "api"
+        : result.kind === "response"
+          ? classifyFailure({ info: result.info, parts: result.parts }, input.config.content_filter_patterns)
+          : null
+      if (failure !== null) {
+        const error = result.kind === "failure" ? result.error : result.kind === "response" ? result.info.error : null
+        const detail = JSON.stringify(error, (_key, value: unknown) => value instanceof Error
+          ? { ...value, name: value.name, message: value.message }
+          : value) ?? "null"
+        const thrownStatus = result.kind === "failure" && typeof result.error === "object" && result.error !== null
+          && "status" in result.error && typeof result.error.status === "number" ? result.error.status : undefined
+        const status = result.kind === "response" && result.info.error?.name === "APIError" ? result.info.error.data.statusCode : thrownStatus
+        await input.log.warn({ msg: "advisor attempt failed", advisor: input.entry.slug, model: model.long, agent, failure_kind: failure, ...(status === undefined ? {} : { status }), detail: redact(detail).slice(0, 600) })
+      }
+      if (refreshIndex > 0 || result.kind !== "failure" || !(result.error instanceof AdvisorCallError) || result.error.status !== 404) break
+      sessionID = await input.refreshSession()
     }
     if (result.kind === "timeout") {
       await input.store.appendTranscript(input.watchedID, transcript({ input, sessionID, model, outcome: "timeout", duration: result.duration, failureKind: "timeout" }))
       return { slug: input.entry.slug, outcome: "timeout", notes: [] }
     }
-    const failure = result.kind === "failure"
-      ? classifyFailure({ thrown: result.error }, input.config.content_filter_patterns)
-      : classifyFailure({ info: result.info, parts: result.parts }, input.config.content_filter_patterns)
     if (failure !== null) {
       await input.store.appendTranscript(input.watchedID, transcript({ input, sessionID, model, outcome: "error", ...(result.kind === "response" ? { result } : { duration: result.duration }), failureKind: failure }))
       const canFallback = !isFallback && input.entry.fallback !== undefined && !input.cooldowns.isCooled(input.entry.fallback.long)
