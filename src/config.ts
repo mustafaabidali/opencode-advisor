@@ -38,7 +38,7 @@ export type LoadConfigOptions = Readonly<{
 
 export const DEFAULTS = {
   enabled: true,
-  default_model: "amazon-bedrock/openai.gpt-5.6-sol:xhigh",
+  default_model: "amazon-bedrock/openai.gpt-5.6-sol:max",
   default_fallback: "amazon-bedrock/us.anthropic.claude-fable-5-1:xhigh",
   min_severity: "nit",
   toast: true,
