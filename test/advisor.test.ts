@@ -290,7 +290,12 @@ describe("AdvisorRuntime", () => {
     // Given
     const client = new FakeClient()
     client.promptScripts.push(
-      async () => ({ data: assistant("Output blocked by content filter"), response: { status: 200 } }),
+      async () => ({
+        data: assistant("", {
+          error: { name: "UnknownError", data: { message: "Output blocked by content filter" } },
+        }),
+        response: { status: 200 },
+      }),
       async () => ({ data: assistant(""), response: { status: 200 } }),
     )
     const { runtime: subject, store } = runtime({ client })
@@ -302,6 +307,26 @@ describe("AdvisorRuntime", () => {
     expect(result?.outcome).toBe("fallback")
     expect(client.prompts[1]?.body.agent).toBe("advisor-reviewer-fb")
     expect(store.transcripts[0]?.failure_kind).toBe("content_filter")
+  })
+
+  test("keeps healthy advice containing content-filter wording", async () => {
+    // Given
+    const client = new FakeClient()
+    client.promptScripts.push(async () => ({
+      data: assistant('<advice severity="concern">note: This is blocked by a missing import</advice>'),
+      response: { status: 200 },
+    }))
+    const cooldowns = new CooldownRegistry(() => 1_000)
+    const { runtime: subject, store } = runtime({ client, cooldowns })
+
+    // When
+    const [result] = await subject.runPass("root", "idle", {})
+
+    // Then
+    expect(result?.outcome).toBe("ok")
+    expect(store.notes).toHaveLength(1)
+    expect(client.prompts).toHaveLength(1)
+    expect(cooldowns.isCooled(PRIMARY)).toBe(false)
   })
 
   test("recreates a cached child session when prompting it returns 404", async () => {

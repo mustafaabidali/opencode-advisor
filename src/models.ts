@@ -73,20 +73,20 @@ export function classifyFailure(
   if (contentFilterStep || patterns.some((pattern) => new RegExp(pattern, "i").test(text))) {
     return "content_filter"
   }
-  if (details.statusCode === 429 || /429|ThrottlingException|TooManyRequests|quota/i.test(text)) {
+  if (details.statusCodes.includes(429) || /429|ThrottlingException|TooManyRequests|quota/i.test(text)) {
     return "throttle"
   }
   if (
     details.names.includes("ProviderAuthError") ||
-    details.statusCode === 401 ||
-    details.statusCode === 403 ||
+    details.statusCodes.includes(401) ||
+    details.statusCodes.includes(403) ||
     /\b(?:401|403)\b/.test(text)
   ) {
     return "auth"
   }
   if (
     details.names.some((name) => /^apierror$/i.test(name)) ||
-    (details.statusCode !== undefined && details.statusCode >= 500)
+    details.statusCodes.some((status) => status >= 500)
   ) {
     return "api"
   }
@@ -99,24 +99,28 @@ export function classifyFailure(
 }
 
 export class CooldownRegistry {
-  private readonly cooledUntil = new Map<string, number>()
+  private readonly cooldowns = new Map<string, number>()
 
   constructor(private readonly clock: () => number = Date.now) {}
 
   markCooled(long: string, ms: number): void {
-    this.cooledUntil.set(long, this.clock() + ms)
+    this.cooldowns.set(long, this.clock() + ms)
   }
 
   isCooled(long: string): boolean {
-    const until = this.cooledUntil.get(long)
-    return until !== undefined && until > this.clock()
+    return this.cooledUntil(long) !== undefined
+  }
+
+  cooledUntil(long: string): number | undefined {
+    const until = this.cooldowns.get(long)
+    return until !== undefined && until > this.clock() ? until : undefined
   }
 
   restoreExpired(): void {
     const now = this.clock()
-    for (const [long, until] of this.cooledUntil) {
+    for (const [long, until] of this.cooldowns) {
       if (until <= now) {
-        this.cooledUntil.delete(long)
+        this.cooldowns.delete(long)
       }
     }
   }
@@ -168,42 +172,40 @@ export function displayName(ref: ModelRef, catalog: ModelCatalog): string {
 type FailureDetails = {
   readonly names: readonly string[]
   readonly text: readonly string[]
-  readonly statusCode?: number
+  readonly statusCodes: readonly number[]
   readonly hasFailure: boolean
 }
 
+type FailureAccumulator = {
+  readonly names: string[]
+  readonly text: string[]
+  readonly statusCodes: number[]
+}
+
+function collectFailure(value: unknown, depth: number, result: FailureAccumulator): void {
+  if (depth > 3 || value === null || value === undefined) return
+  if (typeof value === "string") {
+    result.text.push(value)
+    return
+  }
+  if (typeof value !== "object") return
+
+  if ("name" in value && typeof value.name === "string") {
+    result.names.push(value.name)
+    result.text.push(value.name)
+  }
+  if ("message" in value && typeof value.message === "string") result.text.push(value.message)
+  if ("statusCode" in value && typeof value.statusCode === "number") result.statusCodes.push(value.statusCode)
+  if ("status" in value && typeof value.status === "number") result.statusCodes.push(value.status)
+  if ("detail" in value) collectFailure(value.detail, depth + 1, result)
+  if ("data" in value) collectFailure(value.data, depth + 1, result)
+  if ("error" in value) collectFailure(value.error, depth + 1, result)
+  if ("cause" in value) collectFailure(value.cause, depth + 1, result)
+}
+
 function failureDetails(input: FailureInput): FailureDetails {
-  const names: string[] = []
-  const text: string[] = []
-  let statusCode: number | undefined
-
-  if (input.info?.error !== undefined) {
-    names.push(input.info.error.name)
-    text.push(input.info.error.name)
-    if (input.info.error.data?.message !== undefined) {
-      text.push(input.info.error.data.message)
-    }
-    statusCode = input.info.error.data?.statusCode
-  }
-
-  if (typeof input.thrown === "string") {
-    text.push(input.thrown)
-  } else if (input.thrown instanceof Error) {
-    names.push(input.thrown.name)
-    text.push(input.thrown.name, input.thrown.message)
-  } else if (typeof input.thrown === "object" && input.thrown !== null) {
-    if ("name" in input.thrown && typeof input.thrown.name === "string") {
-      names.push(input.thrown.name)
-      text.push(input.thrown.name)
-    }
-    if ("message" in input.thrown && typeof input.thrown.message === "string") {
-      text.push(input.thrown.message)
-    }
-    if ("statusCode" in input.thrown && typeof input.thrown.statusCode === "number") {
-      statusCode = input.thrown.statusCode
-    }
-  }
-
-  const base = { names, text, hasFailure: input.thrown !== undefined || input.info?.error !== undefined }
-  return statusCode === undefined ? base : { ...base, statusCode }
+  const result: FailureAccumulator = { names: [], text: [], statusCodes: [] }
+  collectFailure(input.info?.error, 0, result)
+  collectFailure(input.thrown, 0, result)
+  return { ...result, hasFailure: input.thrown !== undefined || input.info?.error !== undefined }
 }

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import type { Part } from "@opencode-ai/sdk"
 
+import { AdvisorCallError } from "../src/advisor/pass"
 import {
   buildCatalog,
   classifyFailure,
@@ -227,6 +228,72 @@ describe("classifyFailure", () => {
     // Then
     expect(result).toBe("content_filter")
   })
+
+  test("classifies content-filter text nested in an SDK error detail", () => {
+    // Given
+    const error = new AdvisorCallError("advisor prompt failed", undefined, {
+      name: "UnknownError",
+      data: { message: "requested model does-not-exist" },
+    })
+
+    // When
+    const result = classifyFailure({ thrown: error }, ["does-not-exist"])
+
+    // Then
+    expect(result).toBe("content_filter")
+  })
+
+  test("classifies throttling text nested in an SDK error detail", () => {
+    // Given
+    const error = new AdvisorCallError("advisor prompt failed", undefined, {
+      name: "UnknownError",
+      data: { message: "ThrottlingException: retry later" },
+    })
+
+    // When
+    const result = classifyFailure({ thrown: error }, CONTENT_FILTER_PATTERNS)
+
+    // Then
+    expect(result).toBe("throttle")
+  })
+
+  test("classifies an AdvisorCallError status 429 as throttling", () => {
+    // Given
+    const error = new AdvisorCallError("advisor prompt failed", 429)
+
+    // When
+    const result = classifyFailure({ thrown: error }, CONTENT_FILTER_PATTERNS)
+
+    // Then
+    expect(result).toBe("throttle")
+  })
+
+  test("classifies a provider auth name nested in an SDK error detail", () => {
+    // Given
+    const error = new AdvisorCallError("advisor prompt failed", undefined, {
+      name: "ProviderAuthError",
+    })
+
+    // When
+    const result = classifyFailure({ thrown: error }, CONTENT_FILTER_PATTERNS)
+
+    // Then
+    expect(result).toBe("auth")
+  })
+
+  test("classifies an unrelated SDK error detail as API failure", () => {
+    // Given
+    const error = new AdvisorCallError("advisor prompt failed", undefined, {
+      name: "UnknownError",
+      data: { message: "provider returned an unrelated failure" },
+    })
+
+    // When
+    const result = classifyFailure({ thrown: error }, CONTENT_FILTER_PATTERNS)
+
+    // Then
+    expect(result).toBe("api")
+  })
 })
 
 describe("CooldownRegistry and pickModel", () => {
@@ -282,6 +349,22 @@ describe("CooldownRegistry and pickModel", () => {
 
     // Then
     expect(result).toEqual({ ref: primary, isFallback: false })
+  })
+
+  test("returns the active cooldown expiry and omits it after expiry", () => {
+    // Given
+    let now = 1_000
+    const registry = new CooldownRegistry(() => now)
+    registry.markCooled(primary.long, 500)
+
+    // When
+    const active = registry.cooledUntil(primary.long)
+    now = 1_501
+    const expired = registry.cooledUntil(primary.long)
+
+    // Then
+    expect(active).toBe(1_500)
+    expect(expired).toBeUndefined()
   })
 })
 

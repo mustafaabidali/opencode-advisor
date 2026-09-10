@@ -210,14 +210,9 @@ export async function executeAdvisorPass(input: ExecutePassInput): Promise<PassR
       await input.store.appendTranscript(input.watchedID, transcript({ input, sessionID, model, outcome: "timeout", duration: result.duration, failureKind: "timeout" }))
       return { slug: input.entry.slug, outcome: "timeout", notes: [] }
     }
-    const responseText = result.kind === "response"
-      ? result.parts.filter((part) => part.type === "text").map((part) => part.text).join("\n")
-      : ""
     const failure = result.kind === "failure"
       ? classifyFailure({ thrown: result.error }, input.config.content_filter_patterns)
-      : input.config.content_filter_patterns.some((pattern) => new RegExp(pattern, "i").test(responseText))
-        ? "content_filter"
-        : classifyFailure({ info: result.info, parts: result.parts }, input.config.content_filter_patterns)
+      : classifyFailure({ info: result.info, parts: result.parts }, input.config.content_filter_patterns)
     if (failure !== null) {
       await input.store.appendTranscript(input.watchedID, transcript({ input, sessionID, model, outcome: "error", ...(result.kind === "response" ? { result } : { duration: result.duration }), failureKind: failure }))
       const canFallback = !isFallback && input.entry.fallback !== undefined && !input.cooldowns.isCooled(input.entry.fallback.long)
