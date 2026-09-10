@@ -101,6 +101,12 @@ export class Deliverer {
     const known = new Set(queued.notes.map((entry) => entry.id))
     queued.notes.push(...notes.filter((entry) => !known.has(entry.id)))
     this.#queued.set(watchedID, queued)
+    await this.#options.log.info({
+      msg: "advisor card queued",
+      sessionID: watchedID,
+      noteIDs,
+      status: this.#lastStatus.get(watchedID),
+    })
     if (this.#lastStatus.get(watchedID) === "idle") await this.flushOnIdle(watchedID)
   }
 
@@ -141,8 +147,27 @@ export class Deliverer {
         await this.#deliveryFailed(sessionID, queued, ids, result.error)
         return
       }
+      const messageID =
+        typeof info === "object" && info !== null && "id" in info && typeof info.id === "string"
+          ? info.id
+          : undefined
       await this.#options.store.markDelivered(ids, new Date(this.#options.clock()).toISOString())
+      await this.#options.log.info({
+        msg: "advisor card delivered",
+        sessionID,
+        noteIDs: ids,
+        ...(messageID === undefined ? {} : { messageID }),
+      })
+      const pendingBlockers = this.#transformer.pendingBlockers.get(sessionID)
+      const clearedBlocker = pendingBlockers?.some((entry) => ids.includes(entry.note.id)) === true
       this.#transformer.removeDelivered(sessionID, ids)
+      if (clearedBlocker) {
+        await this.#options.log.info({
+          msg: "blocker cleared after card",
+          sessionID,
+          noteIDs: ids,
+        })
+      }
       this.#queued.delete(sessionID)
     } catch (error) {
       await this.#deliveryFailed(sessionID, queued, ids, error)

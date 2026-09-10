@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import type {
   AssistantMessage,
+  Event,
   EventMessageUpdated,
   EventSessionCreated,
   EventSessionDeleted,
@@ -65,11 +66,18 @@ class FakeClient {
   }
 }
 
-function createLogger(): Readonly<{ logger: Logger; errors: LogFields[] }> {
+function createLogger(): Readonly<{ logger: Logger; infos: LogFields[]; errors: LogFields[] }> {
+  const infos: LogFields[] = []
   const errors: LogFields[] = []
   const ignore = async (): Promise<void> => {}
   return {
-    logger: { debug: ignore, info: ignore, warn: ignore, error: async (fields) => { errors.push(fields) } },
+    logger: {
+      debug: ignore,
+      info: async (fields) => { infos.push(fields) },
+      warn: ignore,
+      error: async (fields) => { errors.push(fields) },
+    },
+    infos,
     errors,
   }
 }
@@ -149,6 +157,22 @@ function harness(options: Readonly<{
 }
 
 describe("Watcher registry", () => {
+  test("ignores runtime event types missing from the pinned SDK union", async () => {
+    // Given
+    const { watcher, logs } = harness()
+    const runtimeEvents = [
+      { type: "plugin.added", properties: {} } as unknown as Event,
+      { type: "message.part.delta", properties: {} } as unknown as Event,
+    ]
+
+    // When
+    const handled = Promise.all(runtimeEvents.map((event) => watcher.handleEvent(event)))
+
+    // Then
+    await expect(handled).resolves.toBeDefined()
+    expect(logs.errors).toEqual([])
+  })
+
   test("learns roots and stores only the first non-advisor user text", async () => {
     // Given
     const { watcher } = harness()
@@ -175,7 +199,7 @@ describe("Watcher registry", () => {
 
   test("ignores unpromoted children and explicitly marked advisor sessions", async () => {
     // Given
-    const { watcher, time, passes } = harness()
+    const { watcher, time, passes, logs } = harness()
     await watcher.handleEvent(created(session("child", "root")))
     await watcher.handleEvent(created(session("advisor")))
     watcher.markAdvisorSession("advisor")
@@ -189,6 +213,7 @@ describe("Watcher registry", () => {
     expect(watcher.isWatched("child")).toBe(false)
     expect(watcher.isWatched("advisor")).toBe(false)
     expect(passes).toEqual([])
+    expect(logs.infos.filter((fields) => fields["action"] === "ignored")).toHaveLength(2)
   })
 
   test("promotes only children whose assistant mode is enabled in advise_agents", async () => {
@@ -265,7 +290,7 @@ describe("Watcher registry", () => {
 describe("Watcher scheduling", () => {
   test("debounces quick completed assistant steps without restarting the deadline", async () => {
     // Given
-    const { watcher, time, passes } = harness()
+    const { watcher, time, passes, logs } = harness()
     await watcher.handleEvent(created(session("root")))
 
     // When
@@ -278,6 +303,13 @@ describe("Watcher scheduling", () => {
 
     // Then
     expect(passes).toEqual([{ sessionID: "root", reason: "step" }])
+    expect(logs.infos).toEqual([
+      { msg: "advisor trigger", sessionID: "root", reason: "step", action: "scheduled" },
+      { msg: "advisor trigger", sessionID: "root", reason: "step", action: "debounced" },
+      { msg: "advisor trigger", sessionID: "root", reason: "step", action: "debounced" },
+      { msg: "advisor pass start", sessionID: "root", reason: "step" },
+      { msg: "advisor pass end", sessionID: "root", reason: "step", durationMs: 0, ok: true },
+    ])
   })
 
   test("idle cancels a pending debounce and runs immediately", async () => {
@@ -298,7 +330,7 @@ describe("Watcher scheduling", () => {
     // Given
     let release: (() => void) | undefined
     const passes: Pass[] = []
-    const { watcher } = harness({
+    const { watcher, logs } = harness({
       config: config({ pass_debounce_ms: 0, cooldown_ms: 0 }),
       onPass: async (sessionID, reason) => {
         passes.push({ sessionID, reason })
@@ -318,11 +350,12 @@ describe("Watcher scheduling", () => {
       { sessionID: "root", reason: "idle" },
       { sessionID: "root", reason: "step" },
     ])
+    expect(logs.infos.filter((fields) => fields["action"] === "dirty")).toHaveLength(5)
   })
 
   test("ignores delivery-agent completions and every trigger inside suppression", async () => {
     // Given
-    const { watcher, time, passes } = harness()
+    const { watcher, time, passes, logs } = harness()
     await watcher.handleEvent(created(session("root")))
 
     // When
@@ -333,11 +366,15 @@ describe("Watcher scheduling", () => {
 
     // Then
     expect(passes).toEqual([])
+    expect(logs.infos).toEqual([
+      { msg: "advisor trigger", sessionID: "root", reason: "step", action: "ignored" },
+      { msg: "advisor trigger", sessionID: "root", reason: "idle", action: "suppressed" },
+    ])
   })
 
   test("enforces cooldown for step passes while idle bypasses it", async () => {
     // Given
-    const { watcher, time, passes } = harness()
+    const { watcher, time, passes, logs } = harness()
     await watcher.handleEvent(created(session("root")))
     await watcher.handleEvent(assistant("root", "build", 1))
     await time.advance(10)
@@ -353,6 +390,12 @@ describe("Watcher scheduling", () => {
       { sessionID: "root", reason: "step" },
       { sessionID: "root", reason: "idle" },
     ])
+    expect(logs.infos).toContainEqual({
+      msg: "advisor trigger",
+      sessionID: "root",
+      reason: "step",
+      action: "cooldown",
+    })
   })
 
   test("logs a rejected pass, clears in-flight state, and accepts the next trigger", async () => {

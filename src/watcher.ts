@@ -12,6 +12,7 @@ import {
   PassScheduler,
   type PassReason,
   type TimerApi,
+  type TriggerAction,
 } from "./watcher/scheduler"
 
 export type ChatMessageInput = Readonly<{
@@ -54,6 +55,7 @@ export class Watcher<Timer> {
   private readonly advisorSessions = new Set<string>()
   private readonly advisedChildren = new Map<string, string>()
   private readonly pendingSessionGets = new Map<string, Promise<void>>()
+  private readonly ignoredRuntimeEventTypes = new Set<string>()
   private readonly scheduler: PassScheduler<Timer>
 
   constructor(private readonly options: WatcherOptions<Timer>) {
@@ -93,6 +95,7 @@ export class Watcher<Timer> {
   }
 
   async handleEvent(event: Event): Promise<void> {
+    const eventType: string = event.type
     switch (event.type) {
       case "session.created":
       case "session.updated":
@@ -138,7 +141,9 @@ export class Watcher<Timer> {
       case "server.connected":
         return
       default:
-        return assertNever(event)
+        if (this.ignoredRuntimeEventTypes.has(eventType)) return
+        this.ignoredRuntimeEventTypes.add(eventType)
+        await this.options.log.debug({ msg: "watcher runtime event ignored", type: eventType })
     }
   }
 
@@ -169,33 +174,51 @@ export class Watcher<Timer> {
   }
 
   private handleMessage(info: Message): void {
-    if (this.advisorSessions.has(info.sessionID)) return
+    if (this.advisorSessions.has(info.sessionID)) {
+      if (info.role === "assistant" && info.time.completed !== undefined) {
+        this.logIgnoredTrigger(info.sessionID, "step")
+      }
+      return
+    }
     if (info.role === "user") {
       if (info.agent === "advisor-delivery") return
       return
     }
-    if (info.mode === "advisor-delivery") return
+    if (info.mode === "advisor-delivery") {
+      if (info.time.completed !== undefined) this.logIgnoredTrigger(info.sessionID, "step")
+      return
+    }
     if (this.children.has(info.sessionID)) {
       const setting = this.options.config.advise_agents[info.mode]
       if (setting !== undefined && setting !== false) {
         this.advisedChildren.set(info.sessionID, info.mode)
       }
     }
-    if (info.time.completed === undefined || !this.isWatched(info.sessionID)) return
+    if (info.time.completed === undefined) return
+    if (!this.isWatched(info.sessionID)) {
+      this.logIgnoredTrigger(info.sessionID, "step")
+      return
+    }
     const root = this.roots.get(info.sessionID)
     if (root !== undefined) this.touchRoot(info.sessionID, root)
     this.scheduler.trigger(info.sessionID, "step")
   }
 
   private async handleIdle(sessionID: string): Promise<void> {
-    if (this.advisorSessions.has(sessionID)) return
+    if (this.advisorSessions.has(sessionID)) {
+      this.logIgnoredTrigger(sessionID, "idle")
+      return
+    }
     if (this.isWatched(sessionID)) {
       const root = this.roots.get(sessionID)
       if (root !== undefined) this.touchRoot(sessionID, root)
       this.scheduler.trigger(sessionID, "idle")
       return
     }
-    if (this.children.has(sessionID)) return
+    if (this.children.has(sessionID)) {
+      this.logIgnoredTrigger(sessionID, "idle")
+      return
+    }
     const pending = this.pendingSessionGets.get(sessionID)
     if (pending !== undefined) {
       await pending
@@ -215,6 +238,7 @@ export class Watcher<Timer> {
       }
       this.registerSession(result.data)
       if (this.isWatched(sessionID)) this.scheduler.trigger(sessionID, "idle")
+      else this.logIgnoredTrigger(sessionID, "idle")
     } catch (error) {
       await this.options.log.error({ msg: "watcher.session.get.failed", sessionID, error })
     } finally {
@@ -233,8 +257,9 @@ export class Watcher<Timer> {
     this.advisorSessions.delete(sessionID)
     this.forgetSession(sessionID)
   }
-}
 
-function assertNever(value: never): never {
-  throw new Error(`Unhandled event: ${JSON.stringify(value)}`)
+  private logIgnoredTrigger(sessionID: string, reason: PassReason): void {
+    const action: TriggerAction = "ignored"
+    void this.options.log.info({ msg: "advisor trigger", sessionID, reason, action })
+  }
 }

@@ -3,7 +3,7 @@ import { describe, expect, test } from "bun:test"
 import type { AssistantMessage, Event, Part, UserMessage } from "@opencode-ai/sdk"
 
 import { Deliverer, type DelivererOptions } from "../src/deliver"
-import type { Logger } from "../src/log"
+import type { LogFields, Logger } from "../src/log"
 import type { Note } from "../src/notes"
 import { ROOT_STANDING_RULE } from "../src/prompts"
 
@@ -83,6 +83,7 @@ type Harness = Readonly<{
     ? Input[]
     : never
   suppressed: Array<Readonly<{ sessionID: string; milliseconds: number }>>
+  infos: LogFields[]
   store: DelivererOptions["store"]
 }>
 
@@ -102,6 +103,7 @@ function makeHarness(
   const shellCalls: Harness["shellCalls"] = []
   const toastBodies: Harness["toastBodies"] = []
   const suppressed: Harness["suppressed"] = []
+  const infos: LogFields[] = []
   const pending = new Set<string>()
   const shellStatuses = [...(options.shellStatuses ?? [200])]
   const store = {
@@ -150,7 +152,7 @@ function makeHarness(
   } satisfies DelivererOptions["client"]
   const log: Logger = {
     debug: async () => undefined,
-    info: async () => undefined,
+    info: async (fields) => { infos.push(fields) },
     warn: async () => undefined,
     error: async () => undefined,
   }
@@ -159,6 +161,7 @@ function makeHarness(
     shellCalls,
     toastBodies,
     suppressed,
+    infos,
     store,
     deliverer: new Deliverer({
       config: {
@@ -187,6 +190,37 @@ async function status(deliverer: Deliverer, type: "busy" | "idle"): Promise<void
 }
 
 describe("Deliverer cards and notifications", () => {
+  test("logs queued, delivered, and blocker-cleared card transitions", async () => {
+    // Given
+    const harness = makeHarness({ toast: false })
+    await status(harness.deliverer, "busy")
+
+    // When
+    await harness.deliverer.deliver("root-1", [note("block-1", "blocker"), note("c-1")])
+    await status(harness.deliverer, "idle")
+
+    // Then
+    expect(harness.infos).toEqual([
+      {
+        msg: "advisor card queued",
+        sessionID: "root-1",
+        noteIDs: ["block-1", "c-1"],
+        status: "busy",
+      },
+      {
+        msg: "advisor card delivered",
+        sessionID: "root-1",
+        noteIDs: ["block-1", "c-1"],
+        messageID: "shell-assistant",
+      },
+      {
+        msg: "blocker cleared after card",
+        sessionID: "root-1",
+        noteIDs: ["block-1", "c-1"],
+      },
+    ])
+  })
+
   test("queues blockers, emits severity toasts, and aborts only when opted in", async () => {
     // Given
     const optedOut = makeHarness()
