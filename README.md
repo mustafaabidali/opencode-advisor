@@ -1,6 +1,6 @@
 # OpenCode Advisor
 
-An asynchronous reviewer watchdog for OpenCode, ported from the advisor workflow in [oh-my-pi](https://github.com/can1357/oh-my-pi). Independent reviewer models read the primary session's transcript in child sessions, may inspect the repository with explicitly granted tools, and deliver only actionable `nit`, `concern`, or `blocker` notes. The primary model and its routing are untouched.
+An asynchronous reviewer watchdog for OpenCode. Independent reviewer models read the primary session's transcript in child sessions, may inspect the repository with explicitly granted tools, and deliver only actionable `nit`, `concern`, or `blocker` notes. The primary model and its routing are untouched.
 
 ## Cards
 
@@ -211,7 +211,7 @@ Both plugins' hooks compose; `opencode.jsonc` and OmO's files are left alone. Re
 
 ## Limitations
 
-- Cards use OpenCode's generic tool-result rendering, not omp's custom renderer. They require the message-part update API in the pinned SDK/server version.
+- Cards use OpenCode's generic tool-result rendering and require the message-part update API in the pinned SDK/server version.
 - A blocker steers the primary at its next LLM step; it does not rewrite a response already in flight.
 - Native cards are scoped to their root session. The manual bare `advisor` command reads directory queues and may include notes from another session in that directory.
 - Duplicate matching preserves code spelling and quoting: paraphrased reports can remain separate. Existing archived notes without finding metadata remain readable but are not retroactively grouped.
@@ -223,7 +223,7 @@ Both plugins' hooks compose; `opencode.jsonc` and OmO's files are left alone. Re
 - `OPENCODE_ADVISOR_ENABLED=0 opencode` starts one process with every hook off.
 - `advisor: command not found`: add `~/.local/bin` to `PATH` and restart the shell and OpenCode.
 - `/advisor` missing or an edit ignored: the file is startup-loaded; restart OpenCode.
-- `no_model` in status: read `cooled_until` in `advisor status --json`. Until the first pass writes state for a directory, `advisor status` prints a plain-text notice rather than JSON.
+- `no_model` in status: read `cooled_until` in `advisor status --json`. When no status snapshot exists for the directory, the command prints a plain-text notice even with `--json`.
 - `no default_model configured` in the log: a roster entry names no model, or there is no roster file; name the model or set `default_model`.
 - `Cache point cannot be inserted after reasoning block` in the log (`failure_kind: poisoned_session`): a reviewer with extended thinking ended a pass with reasoning and no text. The `<silent/>` reply prevents it; when it happens anyway the child session is replaced and the pass retried once on the same model, without a cooldown.
 
@@ -244,3 +244,7 @@ The primary's hooks notify background reviewers and read arrived findings. They 
 | `Deliverer` | Queue arrived notes, recheck task/turn eligibility, and acknowledge exact native-card rendering. |
 
 Attempt cancellation and permit release stay inside reviewer execution. Recovery publishes through the lane once; the runtime does not independently watch or deduplicate pending promises. History projections, logging and usage accounting support these owners without deciding whether the primary may continue.
+
+## License
+
+[MIT](LICENSE).

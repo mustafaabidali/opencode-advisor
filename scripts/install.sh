@@ -12,7 +12,7 @@ CLI_LINK="$LOCAL_BIN/advisor"
 CONFIG_FILE="$OPENCODE_DIR/advisor.jsonc"
 COMMAND_FILE="$OPENCODE_DIR/command/advisor.md"
 SKILLS_DIR="$OPENCODE_DIR/skills"
-SKILL_SOURCE="/Users/mustafa/opencode-advisor/skills/opencode-advisor"
+SKILL_SOURCE="$REPO_ROOT/skills/opencode-advisor"
 SKILL_LINK="$SKILLS_DIR/opencode-advisor"
 
 (cd "$REPO_ROOT" && bun install)
