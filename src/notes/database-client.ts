@@ -66,6 +66,7 @@ class DatabaseClient {
     const remaining = (this.#owners.get(dataDir) ?? 1) - 1
     if (remaining > 0) {
       this.#owners.set(dataDir, remaining)
+      if (this.#failed) await this.#termination
       return
     }
     this.#owners.delete(dataDir)

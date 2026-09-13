@@ -1,0 +1,38 @@
+import type { AdvisorConfig } from "./types"
+
+export const DEFAULTS = {
+  enabled: true,
+  min_severity: "nit",
+  chat_min_severity: "blocker",
+  inject_min_severity: "concern",
+  toast: false,
+  abort_on_blocker: false,
+  fallback_on_content_filter: true,
+  fallback_cooldown_ms: 300000,
+  pass_debounce_ms: 4000,
+  cooldown_ms: 15000,
+  max_delta_chars: 30000,
+  note_ttl_turns: 2,
+  pass_timeout_ms: 180000,
+  abort_grace_ms: 2000,
+  min_fallback_budget_ms: 30000,
+  max_concurrent_passes_per_provider: 0,
+  admission_timeout_ms: 180000,
+  context_budget_tokens: 0,
+  context_budget_fraction: 0.7,
+  context_carry_chars: 24000,
+  log_max_bytes: 10485760,
+  log_retention: 3,
+  pending_ttl_ms: 600000,
+  advise_agents: {},
+  provider_aliases: { "bedrock-mantle": "amazon-bedrock" },
+  variant_aliases: {},
+  content_filter_patterns: [
+    "content[\\s_-]?filter", "filtering policy", "blocked by", "guardrail", "refusal", "output blocked",
+  ],
+  quarantine_patterns: [
+    "rm\\s+-rf", "git\\s+push\\s+--force", "--no-verify", "DROP\\s+TABLE",
+    "git\\s+reset\\s+--hard", "chmod\\s+777", "curl[^\\n]*\\|\\s*sh", ":\\(\\)\\s*\\{",
+  ],
+  log_level: "info",
+} as const satisfies AdvisorConfig

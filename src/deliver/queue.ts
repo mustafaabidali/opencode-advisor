@@ -15,6 +15,7 @@ export class CardQueue {
   readonly #queued = new Map<string, QueuedCards>()
   readonly #flushing = new Set<string>()
   readonly #enqueuing = new Map<string, Promise<void>>()
+  readonly #epochs = new Map<string, object>()
 
   constructor(
     private readonly options: DelivererOptions,
@@ -24,8 +25,10 @@ export class CardQueue {
   ) {}
 
   async enqueue(watchedID: string, notes: readonly Note[]): Promise<void> {
+    const epoch = this.#epochs.get(watchedID) ?? {}
+    this.#epochs.set(watchedID, epoch)
     const previous = this.#enqueuing.get(watchedID) ?? Promise.resolve()
-    const appended = previous.catch(() => {}).then(() => this.#append(watchedID, notes))
+    const appended = previous.catch(() => {}).then(() => this.#append(watchedID, notes, epoch))
     this.#enqueuing.set(watchedID, appended)
     try {
       await appended
@@ -35,8 +38,8 @@ export class CardQueue {
     if (this.turns.canDeliver(watchedID)) await this.flushOnIdle(watchedID)
   }
 
-  async #append(watchedID: string, notes: readonly Note[]): Promise<void> {
-    if (!this.options.isWatched(watchedID)) return
+  async #append(watchedID: string, notes: readonly Note[], epoch: object): Promise<void> {
+    if (!this.options.isWatched(watchedID) || this.#epochs.get(watchedID) !== epoch) return
     const known = new Set(this.#queued.get(watchedID)?.notes.map(findingKey))
     const selected = uniqueFindings(notes).filter((note) => !known.has(findingKey(note)))
     if (selected.length === 0) return
@@ -47,10 +50,7 @@ export class CardQueue {
       await this.options.store.removePending(this.options.directory, noteIDs)
       throw error
     }
-    if (!this.options.isWatched(watchedID)) {
-      await this.options.store.removePending(this.options.directory, noteIDs)
-      return
-    }
+    if (!this.options.isWatched(watchedID) || this.#epochs.get(watchedID) !== epoch) return
     const queued = this.#queued.get(watchedID) ?? { notes: [], attempts: 0 }
     queued.notes.push(...selected)
     this.#queued.set(watchedID, queued)
@@ -67,10 +67,15 @@ export class CardQueue {
     if (queued === undefined || this.#flushing.has(sessionID) ||
       !this.options.isWatched(sessionID) || !this.turns.canDeliver(sessionID)) return
     const epoch = this.turns.epoch(sessionID)
+    const generation = this.#epochs.get(sessionID)
+    const canDeliver = () => this.#epochs.get(sessionID) === generation &&
+      this.options.isWatched(sessionID) && this.turns.canDeliver(sessionID, epoch)
+    const batch = new Set(queued.notes.map((note) => note.id))
+    const destination = { sessionID, epoch }
     this.#flushing.add(sessionID)
     try {
       for (let current = queued.notes[0]; current !== undefined; current = queued.notes[0]) {
-        if (!this.options.isWatched(sessionID) || !this.turns.canDeliver(sessionID, epoch)) return
+        if (!canDeliver()) return
         if (!await this.eligible(current)) {
           queued.notes.shift()
           this.transformer.removeDelivered(sessionID, [current.id])
@@ -89,7 +94,7 @@ export class CardQueue {
           await this.options.log.info({ msg: "advisor card skipped", sessionID, noteIDs: [current.id], status: prepared.status })
           continue
         }
-        if (!this.options.isWatched(sessionID) || !this.turns.canDeliver(sessionID, epoch)) return
+        if (!canDeliver()) return
         if (this.options.client.renderNote === undefined) this.options.suppress(sessionID, 3000)
         let messageID: string | undefined
         const usesShell = this.options.client.renderNote === undefined
@@ -100,7 +105,8 @@ export class CardQueue {
             : await this.options.client.renderNote({
                 note: current,
                 directory: this.options.directory,
-                canRender: () => this.options.isWatched(sessionID) && this.turns.canDeliver(sessionID, epoch),
+                canRender: canDeliver,
+                batch: destination,
               })
         } finally {
           if (usesShell) this.turns.rendering(sessionID, false)
@@ -110,12 +116,12 @@ export class CardQueue {
         queued.attempts = 0
         await this.#recordDelivered(sessionID, current, messageID)
       }
-      this.#queued.delete(sessionID)
+      if (this.#queued.get(sessionID) === queued) this.#queued.delete(sessionID)
     } catch (error) {
-      await this.#deliveryFailed(sessionID, queued, error)
+      await this.#deliveryFailed(sessionID, queued, batch, error)
     } finally {
       this.#flushing.delete(sessionID)
-      if (epoch !== this.turns.epoch(sessionID) && this.turns.canDeliver(sessionID)) {
+      if ((epoch !== this.turns.epoch(sessionID) || this.#epochs.get(sessionID) !== generation) && this.turns.canDeliver(sessionID)) {
         await this.flushOnIdle(sessionID)
       }
     }
@@ -163,7 +169,7 @@ export class CardQueue {
     }
   }
 
-  async #deliveryFailed(sessionID: string, queued: QueuedCards, error: unknown): Promise<void> {
+  async #deliveryFailed(sessionID: string, queued: QueuedCards, batch: ReadonlySet<string>, error: unknown): Promise<void> {
     queued.attempts += 1
     await this.options.log.warn({
       msg: "advisor card delivery failed",
@@ -172,9 +178,12 @@ export class CardQueue {
       error,
     })
     if (queued.attempts < 3) return
-    const ids = queued.notes.map((entry) => entry.id)
+    const ids = queued.notes.filter((entry) => batch.has(entry.id)).map((entry) => entry.id)
     await this.options.store.removePending(this.options.directory, ids)
-    this.#queued.delete(sessionID)
+    const removed = new Set(ids)
+    queued.notes = queued.notes.filter((entry) => !removed.has(entry.id))
+    queued.attempts = 0
+    if (queued.notes.length === 0 && this.#queued.get(sessionID) === queued) this.#queued.delete(sessionID)
     if (!this.options.config.toast) return
     await showToast(this.options.client.tui, this.options.log, {
       title: "Advisor · warning",
@@ -183,4 +192,10 @@ export class CardQueue {
       duration: 8000,
     })
   }
+  forget(sessionID: string): void {
+    this.#queued.delete(sessionID)
+    this.#enqueuing.delete(sessionID)
+    this.#epochs.delete(sessionID)
+  }
+  get size(): number { return this.#queued.size }
 }

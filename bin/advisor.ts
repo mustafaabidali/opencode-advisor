@@ -17,13 +17,15 @@ const { config } = await loadConfig({
   env: environment,
   readFile: (path) => readFile(path, "utf8"),
 })
-const log = createLogger({ level: config.log_level, path: join(dataDir, "advisor.log") })
+const log = createLogger({ level: config.log_level, path: join(dataDir, "advisor.log"),
+  maxBytes: config.log_max_bytes, retention: config.log_retention })
 const store = new NoteStore({
   dataDir,
   log,
 })
 const command = process.argv[2]
 
+try {
 if (command === "--version") {
   const packageJson: unknown = await Bun.file(new URL("../package.json", import.meta.url)).json()
   const version =
@@ -67,6 +69,16 @@ if (command === "--version") {
         ...rows,
         `watched sessions | ${snapshot.watched_sessions.join(", ") || "-"}`,
         `updated_at | ${snapshot.updated_at}`,
+        ...(snapshot.build === undefined ? [] : [
+          `build | ${snapshot.build.version} ${snapshot.build.fingerprint}; instance ${snapshot.build.instance_id}`,
+          `provider admission | ${snapshot.build.admission_scope}; limit ${snapshot.build.max_concurrent_passes_per_provider || "unlimited"}`,
+        ]),
+        ...(snapshot.execution ?? []).map((lane) => `reviewer | ${lane.advisor_slug}; ${lane.root_session}; ${lane.state}`),
+        ...(snapshot.accounting === undefined ? ["usage coverage | legacy snapshot only; totals exclude unobserved steps"] : [
+          `usage coverage | ${snapshot.accounting.coverage}; ${snapshot.accounting.messages} assistant messages; ${snapshot.accounting.unattributed} unattributed; ${snapshot.accounting.unknown_usage} with unknown usage`,
+          `compaction usage | ${snapshot.accounting.summary_messages} messages; estimated cost ${snapshot.accounting.summary_cost}`,
+          "usage scope | durable observed usage; legacy transcripts excluded; pass/note counters are per instance",
+        ]),
       ].join("\n"),
     )
   }
@@ -75,6 +87,9 @@ if (command === "--version") {
   const requested = lastIndex === -1 ? undefined : Number(process.argv[lastIndex + 1])
   const last = Number.isInteger(requested) && requested !== undefined && requested >= 0 ? requested : 10
   const notes = await store.listNotes(cwd, { last })
+  const coverage = await store.catalogStatus()
+  if (!coverage.complete) console.error("Advisor note index is incomplete; run `advisor index --all` to include the remaining legacy files.")
+  if (coverage.unavailable > 0) console.error(`Advisor note index: ${coverage.unavailable} unavailable legacy report files.`)
   if (process.argv.includes("--json")) {
     console.log(JSON.stringify(notes))
   } else {
@@ -85,6 +100,12 @@ if (command === "--version") {
     )
     console.log(["time | severity | model display | note", ...rows].join("\n"))
   }
+} else if (command === "index") {
+  let coverage = await store.backfillNotes()
+  while (process.argv.includes("--all") && !coverage.complete) coverage = await store.backfillNotes()
+  console.log(JSON.stringify(coverage))
+} else if (command === "repair-receipts") {
+  console.log(JSON.stringify(await store.repairReceipts()))
 } else if (command === "--note" && process.argv[3] !== undefined) {
   const noteID = process.argv[3]
   try {
@@ -115,7 +136,8 @@ if (command === "--version") {
   console.log(notes.length === 0 ? "Advisor · no pending notes" : notes.map(renderCard).join("\n\n"))
 } else {
   console.error(
-    "Usage: advisor [--note <id> | status [--json] | notes [--last N] [--json] | --version]",
+    "Usage: advisor [--note <id> | status [--json] | notes [--last N] [--json] | index [--all] | repair-receipts | --version]",
   )
   process.exitCode = 2
 }
+} finally { await store.close(); await log.close?.() }

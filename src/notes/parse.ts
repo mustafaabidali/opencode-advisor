@@ -1,4 +1,5 @@
 import type { AdvisorState, Note, ReviewContext, StateSnapshot, TranscriptOutcome } from "./types"
+import { stateMetadata } from "./state-metadata"
 
 export type PendingPointer = Readonly<{
   noteID: string
@@ -30,6 +31,7 @@ function isOutcome(value: unknown): value is TranscriptOutcome {
     value === "error" ||
     value === "timeout" ||
     value === "quarantined"
+    || value === "context_budget_exceeded"
   )
 }
 
@@ -205,6 +207,7 @@ export function parseStateSnapshot(text: string): StateSnapshot | undefined {
     advisors: advisors.filter((advisor): advisor is AdvisorState => advisor !== undefined),
     watched_sessions: watchedSessions,
     updated_at: updatedAt,
+    ...stateMetadata(value),
   }
 }
 

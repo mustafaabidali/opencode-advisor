@@ -2,80 +2,10 @@ import { homedir } from "node:os"
 import { join } from "node:path"
 
 import { stripJsonComments } from "./config/jsonc"
-
-export type AdvisorSeverity = "nit" | "concern" | "blocker"
-export type AdvisorLogLevel = "debug" | "info" | "warn" | "error"
-export type ConfigEnvironment = Readonly<Record<string, string | undefined>>
-export type AdvisorConfig = Readonly<{
-  enabled: boolean
-  default_model?: string
-  default_fallback?: string
-  min_severity: AdvisorSeverity
-  chat_min_severity: AdvisorSeverity
-  inject_min_severity: AdvisorSeverity
-  toast: boolean
-  abort_on_blocker: boolean
-  fallback_on_content_filter: boolean
-  fallback_cooldown_ms: number
-  pass_debounce_ms: number
-  cooldown_ms: number
-  max_delta_chars: number
-  note_ttl_turns: number
-  pass_timeout_ms: number
-  pending_ttl_ms: number
-  advise_agents: Readonly<Record<string, boolean | string>>
-  provider_aliases: Readonly<Record<string, string>>
-  variant_aliases: Readonly<Record<string, string>>
-  content_filter_patterns: readonly string[]
-  quarantine_patterns: readonly string[]
-  log_level: AdvisorLogLevel
-}>
-
-export type LoadConfigOptions = Readonly<{
-  home: string
-  cwd: string
-  env: ConfigEnvironment
-  readFile: (path: string) => Promise<string>
-}>
-
-export const DEFAULTS = {
-  enabled: true,
-  min_severity: "nit",
-  chat_min_severity: "blocker",
-  inject_min_severity: "concern",
-  toast: false,
-  abort_on_blocker: false,
-  fallback_on_content_filter: true,
-  fallback_cooldown_ms: 300000,
-  pass_debounce_ms: 4000,
-  cooldown_ms: 15000,
-  max_delta_chars: 30000,
-  note_ttl_turns: 2,
-  pass_timeout_ms: 180000,
-  pending_ttl_ms: 600000,
-  advise_agents: {},
-  provider_aliases: { "bedrock-mantle": "amazon-bedrock" },
-  variant_aliases: {},
-  content_filter_patterns: [
-    "content[\\s_-]?filter",
-    "filtering policy",
-    "blocked by",
-    "guardrail",
-    "refusal",
-    "output blocked",
-  ],
-  quarantine_patterns: [
-    "rm\\s+-rf",
-    "git\\s+push\\s+--force",
-    "--no-verify",
-    "DROP\\s+TABLE",
-    "git\\s+reset\\s+--hard",
-    "chmod\\s+777",
-    "curl[^\\n]*\\|\\s*sh",
-    ":\\(\\)\\s*\\{",
-  ],
-  log_level: "info",
-} as const satisfies AdvisorConfig
+import { DEFAULTS } from "./config/defaults"
+import type { AdvisorConfig, AdvisorLogLevel, AdvisorSeverity, ConfigEnvironment, LoadConfigOptions } from "./config/types"
+export { DEFAULTS } from "./config/defaults"
+export type { AdvisorConfig, AdvisorLogLevel, AdvisorSeverity, ConfigEnvironment, LoadConfigOptions } from "./config/types"
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -139,6 +69,21 @@ function applyValue(
     case "pass_timeout_ms":
     case "pending_ttl_ms":
       if (typeof value !== "number" || !Number.isFinite(value)) break
+      return { ...config, [key]: value }
+    case "abort_grace_ms":
+    case "min_fallback_budget_ms":
+    case "admission_timeout_ms":
+    case "context_carry_chars":
+    case "log_max_bytes":
+    case "log_retention":
+      if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) break
+      return { ...config, [key]: value }
+    case "max_concurrent_passes_per_provider":
+    case "context_budget_tokens":
+      if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) break
+      return { ...config, [key]: value }
+    case "context_budget_fraction":
+      if (typeof value !== "number" || !Number.isFinite(value) || value <= 0 || value >= 1) break
       return { ...config, [key]: value }
     case "advise_agents":
       if (!isAdviseAgents(value)) break

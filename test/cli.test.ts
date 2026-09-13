@@ -203,6 +203,19 @@ describe("advisor CLI", () => {
     expect(JSON.parse(result.stdout.toString())).toEqual(snapshot)
   })
 
+  test("a fresh current build reports unknown usage coverage before its first attempt", async () => {
+    const { project, xdg, store } = await fixture()
+    await store.writeState(project, { ...stateSnapshot(), build: {
+      version: "0.2.0", fingerprint: "fixture", instance_id: "instance", started_at: "2026-09-13T00:00:00.000Z",
+      admission_scope: "process", max_concurrent_passes_per_provider: 0,
+    } })
+    const result = runCli(project, xdg, ["status", "--json"])
+    expect(result.exitCode).toBe(0)
+    expect(JSON.parse(result.stdout.toString()).accounting).toMatchObject({
+      attempts: 0, messages: 0, coverage: "unknown",
+    })
+  })
+
   test("prints the current directory state as a readable table", async () => {
     // Given
     const { project, xdg, store } = await fixture()
@@ -217,7 +230,8 @@ describe("advisor CLI", () => {
       "slug | model display (variant) | fallback display | tools | enabled | cooled until | passes | notes | cost\n" +
         "reviewer | GPT-5.6 Sol (xhigh) | us.anthropic.claude-fable-5-1 | read, grep, glob | true | 2026-09-10T13:00:00.000Z | 3 | 1 | 0.42\n" +
         "watched sessions | root-1\n" +
-        "updated_at | 2026-09-10T12:34:56.000Z\n",
+        "updated_at | 2026-09-10T12:34:56.000Z\n" +
+        "usage coverage | legacy snapshot only; totals exclude unobserved steps\n",
     )
   })
 
@@ -308,7 +322,7 @@ describe("advisor CLI", () => {
     expect(result.exitCode).toBe(2)
     expect(result.stdout.toString()).toBe("")
     expect(result.stderr.toString()).toBe(
-      "Usage: advisor [--note <id> | status [--json] | notes [--last N] [--json] | --version]\n",
+      "Usage: advisor [--note <id> | status [--json] | notes [--last N] [--json] | index [--all] | repair-receipts | --version]\n",
     )
   })
 

@@ -66,18 +66,20 @@ class FakeClient {
   }
 }
 
-function createLogger(): Readonly<{ logger: Logger; infos: LogFields[]; errors: LogFields[] }> {
+function createLogger(): Readonly<{ logger: Logger; infos: LogFields[]; debugs: LogFields[]; errors: LogFields[] }> {
   const infos: LogFields[] = []
+  const debugs: LogFields[] = []
   const errors: LogFields[] = []
   const ignore = async (): Promise<void> => {}
   return {
     logger: {
-      debug: ignore,
+      debug: async (fields) => { debugs.push(fields) },
       info: async (fields) => { infos.push(fields) },
       warn: ignore,
       error: async (fields) => { errors.push(fields) },
     },
     infos,
+    debugs,
     errors,
   }
 }
@@ -213,7 +215,7 @@ describe("Watcher registry", () => {
     expect(watcher.isWatched("child")).toBe(false)
     expect(watcher.isWatched("advisor")).toBe(false)
     expect(passes).toEqual([])
-    expect(logs.infos.filter((fields) => fields["action"] === "ignored")).toHaveLength(2)
+    expect(logs.debugs.filter((fields) => fields["action"] === "ignored")).toHaveLength(2)
   })
 
   test("promotes only children whose assistant mode is enabled in advise_agents", async () => {
@@ -366,10 +368,8 @@ describe("Watcher scheduling", () => {
 
     // Then
     expect(passes).toEqual([])
-    expect(logs.infos).toEqual([
-      { msg: "advisor trigger", sessionID: "root", reason: "step", action: "ignored" },
-      { msg: "advisor trigger", sessionID: "root", reason: "idle", action: "suppressed" },
-    ])
+    expect(logs.infos).toEqual([{ msg: "advisor trigger", sessionID: "root", reason: "idle", action: "suppressed" }])
+    expect(logs.debugs).toContainEqual({ msg: "advisor trigger", sessionID: "root", reason: "step", action: "ignored" })
   })
 
   test("enforces cooldown for step passes while idle bypasses it", async () => {

@@ -1,8 +1,15 @@
 import { displayLevel, displayName, type CooldownRegistry, type ModelCatalog } from "../models"
 import type { StateSnapshot, TranscriptOutcome } from "../notes"
 import type { AdvisorEntry } from "../roster"
+import type { PassResult } from "./pass-types"
 
 export type AdvisorStats = { passes: number; notes: number; cost: number; lastPassAt: string; lastOutcome: TranscriptOutcome }
+export function recordStats(stats: Map<string, AdvisorStats>, slug: string, result: PassResult,
+  cost: number, count: number, now: number): void {
+  const previous = stats.get(slug)
+  stats.set(slug, { passes: (previous?.passes ?? 0) + count, notes: (previous?.notes ?? 0) + result.notes.length,
+    cost: (previous?.cost ?? 0) + cost, lastPassAt: new Date(now).toISOString(), lastOutcome: result.outcome })
+}
 
 export type SnapshotInput = Readonly<{
   roster: readonly AdvisorEntry[]

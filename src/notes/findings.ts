@@ -1,6 +1,9 @@
 import { acquireDatabase, DatabaseRequestNotSentError, DatabaseUnavailableError, type DatabaseHandle } from "./database-client"
 import type { Arguments, Operation, Result } from "./database-protocol"
 import type { DispositionInput, Finding, FindingQuery, Note, TaskSnapshot } from "./types"
+import type { UsageAttempt, UsageCoverage, UsageRecord, UsageState } from "../usage/types"
+import type { CatalogCursor } from "./catalog-database"
+import type { JournalKey } from "../advisor/journal-data"
 
 /** Async interface: SQLite and lock waits run only in the database worker. */
 export class FindingStore {
@@ -8,6 +11,35 @@ export class FindingStore {
   #closed = false
   #closing: Promise<void> | undefined
   constructor(private readonly dataDir: string) {}
+  readJournal(key: JournalKey) { return this.#request("readJournal", [key]) }
+  claimJournal(key: JournalKey, owner: string, pid: number, previous: string | null) {
+    return this.#request("claimJournal", [key, owner, pid, previous])
+  }
+  saveJournal(key: JournalKey, owner: string, payload: string) { return this.#request("saveJournal", [key, owner, payload]) }
+  releaseJournal(key: JournalKey, owner: string) { return this.#request("releaseJournal", [key, owner]) }
+
+  beginUsage(attempt: UsageAttempt) { return this.#request("beginUsage", [attempt]) }
+  getUsage(id: string) { return this.#request("getUsage", [id]) }
+  usageForPass(id: string) { return this.#request("usageForPass", [id]) }
+  findUsage(sessionID: string, created: number, parentID: string) {
+    return this.#request("findUsage", [sessionID, created, parentID])
+  }
+  usagePrompt(id: string, promptID: string) { return this.#request("usagePrompt", [id, promptID]) }
+  finishUsage(id: string, state: UsageState, time: number, coverage: UsageCoverage) {
+    return this.#request("finishUsage", [id, state, time, coverage])
+  }
+  recordUsage(row: UsageRecord, authoritative = false) { return this.#request("recordUsage", [row, authoritative]) }
+  usageSummary(cwd: string, rootSession?: string) { return this.#request("usageSummary", [cwd, rootSession]) }
+  catalogProgress() { return this.#request("catalogProgress", []) }
+  catalogMissing(ids: readonly string[]) { return this.#request("catalogMissing", [ids]) }
+  catalogIndex(notes: readonly Note[], unavailable: readonly string[], cursor?: string, complete?: boolean) {
+    return this.#request("catalogIndex", [notes, unavailable, cursor, complete])
+  }
+  catalogPage(cwd: string, limit: number, cursor?: CatalogCursor) { return this.#request("catalogPage", [cwd, limit, cursor]) }
+  acknowledge(ids: readonly string[], at: string) { return this.#request("acknowledge", [ids, at]) }
+  receipts(ids: readonly string[]) { return this.#request("receipts", [ids]) }
+  receiptPage(after: string, limit: number) { return this.#request("receiptPage", [after, limit]) }
+  delivered(findings: readonly Pick<Finding, "id" | "reopened_at">[]) { return this.#request("delivered", [findings]) }
 
   readTask(cwd: string, rootSession: string): Promise<TaskSnapshot | undefined> {
     return this.#request("readTask", [cwd, rootSession])

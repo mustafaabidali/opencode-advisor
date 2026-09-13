@@ -22,6 +22,7 @@ export type DeliveryClient = Readonly<{
     note: Note
     directory: string
     canRender: () => boolean
+    batch?: object
   }>) => Promise<string | undefined>
   session: Readonly<{
     shell: (request: ShellRequest) => Promise<ClientResult>

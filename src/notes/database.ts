@@ -1,6 +1,11 @@
 import { openDatabase } from "./schema"
 import { readFindings } from "./queries"
 import type { DispositionInput, Finding, FindingQuery, Note, TaskSnapshot } from "./types"
+import { UsageDatabase } from "../usage/database"
+import type { UsageAttempt, UsageCoverage, UsageRecord, UsageState } from "../usage/types"
+import { CatalogDatabase, type CatalogCursor } from "./catalog-database"
+import { JournalDatabase } from "./journal-database"
+import type { JournalKey } from "../advisor/journal-data"
 
 type FindingRow = Omit<Finding, "provenance" | "disposition" | "verification" | "reopened_at">
 type TaskRow = { task_id: string; revision: string; user_message_id: string | null; stopped: number; next_action: string | null }
@@ -8,8 +13,41 @@ type TaskRow = { task_id: string; revision: string; user_message_id: string | nu
 /** Synchronous implementation, owned exclusively by the database worker. */
 export class FindingDatabase {
   readonly #db
-  constructor(dataDir: string) { this.#db = openDatabase(dataDir) }
+  readonly #usage
+  readonly #catalog
+  readonly #journal
+  constructor(dataDir: string) {
+    this.#db = openDatabase(dataDir)
+    this.#usage = new UsageDatabase(this.#db)
+    this.#catalog = new CatalogDatabase(this.#db)
+    this.#journal = new JournalDatabase(this.#db)
+  }
   close(): void { this.#db.close(true) }
+  readJournal(key: JournalKey) { return this.#journal.read(key) }
+  claimJournal(key: JournalKey, owner: string, pid: number, previous: string | null) { return this.#journal.claim(key, owner, pid, previous) }
+  saveJournal(key: JournalKey, owner: string, payload: string) { return this.#journal.save(key, owner, payload) }
+  releaseJournal(key: JournalKey, owner: string) { return this.#journal.release(key, owner) }
+
+  beginUsage(attempt: UsageAttempt): void { this.#usage.begin(attempt) }
+  getUsage(id: string) { return this.#usage.get(id) }
+  usageForPass(id: string) { return this.#usage.forPass(id) }
+  findUsage(sessionID: string, created: number, parentID: string) { return this.#usage.find(sessionID, created, parentID) }
+  usagePrompt(id: string, promptID: string): void { this.#usage.prompt(id, promptID) }
+  finishUsage(id: string, state: UsageState, time: number, coverage: UsageCoverage): void {
+    this.#usage.finish(id, state, time, coverage)
+  }
+  recordUsage(row: UsageRecord, authoritative: boolean): boolean { return this.#usage.record(row, authoritative) }
+  usageSummary(cwd: string, rootSession?: string) { return this.#usage.summary(cwd, rootSession) }
+  catalogProgress() { return this.#catalog.progress() }
+  catalogMissing(ids: readonly string[]) { return this.#catalog.missing(ids) }
+  catalogIndex(notes: readonly Note[], unavailable: readonly string[], cursor?: string, complete?: boolean) {
+    this.#catalog.indexBatch(notes, unavailable, cursor, complete)
+  }
+  catalogPage(cwd: string, limit: number, cursor?: CatalogCursor) { return this.#catalog.page(cwd, limit, cursor) }
+  acknowledge(ids: readonly string[], at: string) { this.#catalog.acknowledge(ids, at) }
+  receipts(ids: readonly string[]) { return this.#catalog.receipts(ids) }
+  receiptPage(after: string, limit: number) { return this.#catalog.receiptPage(after, limit) }
+  delivered(findings: readonly Pick<Finding, "id" | "reopened_at">[]) { return this.#catalog.delivered(findings) }
 
   readTask(cwd: string, rootSession: string): TaskSnapshot | undefined {
     const row = this.#db.query<TaskRow, [string, string]>(
@@ -74,14 +112,15 @@ export class FindingDatabase {
 
   record(note: Note): void {
     const id = note.finding_id
-    if (id === undefined) return
     const db = this.#db
     db.transaction(() => {
+      this.#catalog.index(note)
+      if (id === undefined) return
       const revision = note.review?.revision ?? "unversioned"
       db.query(`
         INSERT INTO findings (id, issue_id, cwd, root_session, task_id, reviewed_revision, state, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, 'open', ?)
-        ON CONFLICT(id) DO UPDATE SET updated_at = excluded.updated_at
+        ON CONFLICT(id) DO UPDATE SET updated_at = MAX(updated_at, excluded.updated_at)
       `).run(id, note.issue_id ?? id, note.cwd, note.root_session, note.review?.task_id ?? note.root_session, revision, note.time)
       db.query("INSERT OR IGNORE INTO finding_sources VALUES (?, ?, ?, ?, ?, ?)")
         .run(note.id, id, note.advisor_slug, note.model, note.time, revision)

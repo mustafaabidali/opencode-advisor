@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test"
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -425,7 +425,8 @@ test("a note is never written without its finding row", async () => {
 
   await expect(store.writeNote(input())).rejects.toThrow()
 
-  expect(await store.listNotes("/project", { last: 10 })).toEqual([])
+  expect(await readdir(join(dataDir, "notes"))).toEqual([])
+  await store.close()
 })
 
 test("a partial note write leaves no indexed source and unrelated checkpoints still work", async () => {

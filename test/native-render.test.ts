@@ -12,6 +12,29 @@ const note: Note = {
   evidence: ["src/deliver/cards.ts"], is_fallback: false, quarantined: false,
 }
 
+test("ten cards share one destination read and a new flush revalidates it", async () => {
+  let reads = 0
+  let writes = 0
+  const client = createOpencodeClient({
+    baseUrl: "http://embedded.test",
+    fetch: async (request) => {
+      const path = new URL(request.url).pathname
+      if (path === "/session/status") return Response.json({})
+      if (request.method === "PATCH") { writes++; return Response.json(await request.json()) }
+      reads++
+      return Response.json([{ info: { id: "primary", role: "assistant", sessionID: note.root_session,
+        time: { created: 1, completed: 2 }, agent: "build", mode: "build" }, parts: [] }])
+    },
+  })
+  const render = createNativeRenderer(client)
+  const batch = {}
+  for (let i = 0; i < 10; i++) await render({ note: { ...note, id: `note-${i}` }, directory: "/project", canRender: () => true, batch })
+  expect(reads).toBe(1)
+  expect(writes).toBe(10)
+  await render({ note: { ...note, id: "next" }, directory: "/project", canRender: () => true, batch: {} })
+  expect(reads).toBe(2)
+})
+
 test("native rendering reuses the SDK's embedded transport and writes a card once without a shell", async () => {
   const paths: string[] = []
   const parts: unknown[] = []

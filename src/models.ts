@@ -59,6 +59,7 @@ export function displayLevel(ref: ModelRef): string | undefined {
 export type FailureInput = {
   readonly thrown?: unknown
   readonly info?: {
+    readonly finish?: string
     readonly error?: {
       readonly name: string
       readonly data?: { readonly message?: string; readonly statusCode?: number; readonly responseBody?: string }
@@ -82,7 +83,8 @@ export function classifyFailure(
       (part.reason === "content-filter" || part.reason === "content_filter"),
   )
 
-  if (contentFilterStep || patterns.some((pattern) => new RegExp(pattern, "i").test(text))) {
+  if (contentFilterStep || /^content[-_]filter$/i.test(input.info?.finish ?? "") ||
+    patterns.some((pattern) => new RegExp(pattern, "i").test(text))) {
     return "content_filter"
   }
   if (details.statusCodes.includes(429) || /429|ThrottlingException|TooManyRequests|quota/i.test(text)) {
@@ -151,23 +153,27 @@ export function pickModel(
   return null
 }
 
-export type ModelCatalog = ReadonlyMap<string, string>
+export type ModelCatalog = ReadonlyMap<string, string> & Readonly<{ limits?: ReadonlyMap<string, number> }>
 
 export function buildCatalog(response: {
   readonly providers: readonly {
     readonly id: string
-    readonly models: Readonly<Record<string, { readonly name?: string }>>
+    readonly models: Readonly<Record<string, { readonly name?: string; readonly limit?: { readonly context?: number } }>>
   }[]
 }): ModelCatalog {
   const catalog = new Map<string, string>()
+  const limits = new Map<string, number>()
   for (const provider of response.providers) {
     for (const [modelID, model] of Object.entries(provider.models)) {
       if (model.name !== undefined && model.name.length > 0) {
         catalog.set(`${provider.id}/${modelID}`, model.name)
       }
+      if (model.limit?.context !== undefined && Number.isFinite(model.limit.context) && model.limit.context > 0) {
+        limits.set(`${provider.id}/${modelID}`, model.limit.context)
+      }
     }
   }
-  return catalog
+  return Object.assign(catalog, { limits })
 }
 
 export function displayName(ref: ModelRef, catalog: ModelCatalog): string {

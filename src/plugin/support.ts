@@ -24,6 +24,7 @@ export type PluginDependencies = Readonly<{
   readFile: (path: string) => Promise<string>
   exists: (path: string) => boolean
   clock: () => number
+  monotonicClock: () => number
   timers: AdvisorTimers
   createLogger: (options: LoggerOptions) => Logger
 }>
@@ -75,6 +76,7 @@ export function resolvePluginDependencies(
       overrides.readFile ?? ((path: string) => readFile(path, "utf8")),
     exists: overrides.exists ?? existsSync,
     clock: overrides.clock ?? Date.now,
+    monotonicClock: overrides.monotonicClock ?? overrides.clock ?? (() => performance.now()),
     timers: overrides.timers ?? createTimers(),
     createLogger: overrides.createLogger ?? createLogger,
   }

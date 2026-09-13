@@ -1,4 +1,5 @@
 import type { Logger } from "../log"
+import type { UsageSummary } from "../usage/types"
 
 export type NoteSeverity = "nit" | "concern" | "blocker"
 
@@ -60,6 +61,7 @@ export type Finding = Readonly<{
 }>
 
 export type NoteInput = Readonly<{
+  idempotency_key?: string
   cwd: string
   root_session: string
   advisor_session: string
@@ -102,6 +104,7 @@ export type TranscriptOutcome =
   | "error"
   | "timeout"
   | "quarantined"
+  | "context_budget_exceeded"
 
 export type FailureKind =
   | "throttle"
@@ -154,6 +157,13 @@ export type AdvisorState = Readonly<{
 }>
 
 export type StateSnapshot = Readonly<{
+  build?: import("../identity").BuildIdentity
+  metrics?: Readonly<Record<string, number>>
+  execution?: readonly Readonly<{ root_session: string; advisor_slug: string; advisor_session?: string | undefined;
+    state: string; next_reconcile_at?: number | undefined; next_retry_at?: number | undefined; generation?: number;
+    context_tokens?: number | undefined; context_budget?: number | undefined; context_budget_available?: boolean;
+    context_budget_exceeded?: boolean }>[]
+  accounting?: UsageSummary
   advisors: readonly AdvisorState[]
   watched_sessions: readonly string[]
   updated_at: string

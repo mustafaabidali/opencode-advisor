@@ -1,22 +1,13 @@
-import type { DispositionInput, Finding, Note, NoteStore } from "./notes"
-import { decideAdvice, decideUnavailableAdvice, findingIsActive, needsCompletionDisposition, type AdviceContext, type AdviceDecision } from "./policy"
+import type { DispositionInput, Note, NoteStore } from "./notes"
+import { decideAdvice, decideUnavailableAdvice, findingIsActive, needsCompletionDisposition, type AdviceContext } from "./policy"
 import { severityRank } from "./advice"
+import { checkpointOutput, type CheckpointPage, type Proposal } from "./checkpoint/output"
 
 export type CheckpointUpdate = Omit<DispositionInput, "verification"> & Readonly<{
   verification?: Omit<NonNullable<DispositionInput["verification"]>, "revision">
 }>
 
-type Proposal = Readonly<{
-  finding: Finding
-  decision: AdviceDecision
-  requires_disposition: boolean
-  verification_current: boolean
-  reports: readonly Note[]
-}>
-
-type Issue = { id: string; proposals: Proposal[] }
-
-type CheckpointInput = Readonly<{
+type CheckpointInput = CheckpointPage & Readonly<{
   store: Pick<NoteStore, "listFindings" | "readNotes" | "recordDispositions">
   directory: string
   sessionID: string
@@ -56,7 +47,7 @@ export async function runCheckpoint(input: CheckpointInput) {
     group.push(note)
     reports.set(note.finding_id, group)
   }
-  const issues = new Map<string, Issue>()
+  const proposals: Proposal[] = []
   let completionAllowed = !unavailableReports.some(({ finding }) => findingIsActive(finding, context))
   let actionAllowed = !context.stopped &&
     !unavailableReports.some(({ decision }) => decision.action === "pause_affected_action")
@@ -68,19 +59,17 @@ export async function runCheckpoint(input: CheckpointInput) {
     const requiresDisposition = needsCompletionDisposition(representative, finding, context)
     if (requiresDisposition) completionAllowed = false
     if (decision.action === "pause_affected_action") actionAllowed = false
-    const issue = issues.get(finding.issue_id) ?? { id: finding.issue_id, proposals: [] }
-    issue.proposals.push({
+    proposals.push({
       finding, decision, requires_disposition: requiresDisposition,
       verification_current: finding.verification !== undefined && finding.verification.revision === context.revision,
-      reports: group,
+      reports: [representative, ...group.filter((note) => note.id !== representative.id)],
     })
-    issues.set(issue.id, issue)
   }
+  const paused = new Set([...proposals, ...unavailableReports]
+    .filter((item) => item.decision.action === "pause_affected_action").map((item) => item.finding.id))
   return {
     phase: input.phase, context, completion_allowed: completionAllowed, action_allowed: actionAllowed,
-    unavailable_reports: unavailableReports,
-    issues: [...issues.values()].sort((a, b) => a.id.localeCompare(b.id)).map((issue) => ({
-      ...issue, proposals: issue.proposals.sort((a, b) => a.finding.id.localeCompare(b.finding.id)),
-    })),
+    pause_required: paused.size > 0, paused_finding_count: paused.size,
+    ...checkpointOutput(findings, proposals, unavailableReports, input),
   }
 }

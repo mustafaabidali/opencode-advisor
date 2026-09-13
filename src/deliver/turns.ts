@@ -1,4 +1,5 @@
 import type { Event, Message, UserMessage } from "@opencode-ai/sdk"
+import { remember } from "../cache"
 
 type Turn = {
   epoch: number
@@ -7,6 +8,7 @@ type Turn = {
   awaitingResponse: boolean
   status?: "idle" | "busy" | "retry"
   rendering: boolean
+  latestUserAt: number
 }
 
 /** Shell delivery generates its own status events; only real messages advance a turn. */
@@ -16,7 +18,7 @@ export class DeliveryTurns {
   #turn(sessionID: string): Turn {
     let turn = this.#turns.get(sessionID)
     if (turn === undefined) {
-      turn = { epoch: 0, seen: new Set(), awaitingResponse: false, rendering: false }
+      turn = { epoch: 0, seen: new Set(), awaitingResponse: false, rendering: false, latestUserAt: -Infinity }
       this.#turns.set(sessionID, turn)
     }
     return turn
@@ -25,8 +27,9 @@ export class DeliveryTurns {
   user(info: UserMessage): void {
     if (info.agent?.startsWith("advisor-") || info.id.startsWith("adv_")) return
     const turn = this.#turn(info.sessionID)
-    if (turn.seen.has(info.id)) return
-    turn.seen.add(info.id)
+    if (turn.seen.has(info.id) || info.time.created < turn.latestUserAt) return
+    remember(turn.seen, info.id, 256)
+    turn.latestUserAt = info.time.created
     turn.userID = info.id
     turn.epoch += 1
     turn.awaitingResponse = true
@@ -66,4 +69,6 @@ export class DeliveryTurns {
   rendering(sessionID: string, value: boolean): void {
     this.#turn(sessionID).rendering = value
   }
+  forget(sessionID: string): void { this.#turns.delete(sessionID) }
+  get size(): number { return this.#turns.size }
 }

@@ -1,47 +1,13 @@
-import type {
-  Event,
-  Message,
-  Part,
-  Session,
-  SessionGetError,
-} from "@opencode-ai/sdk"
-
-import type { AdvisorConfig } from "./config"
-import type { Logger } from "./log"
+import type { Event, Message, Session } from "@opencode-ai/sdk"
+import { remember } from "./cache"
 import { isIgnoredEventType } from "./watcher/events"
 import {
   PassScheduler,
   type PassReason,
-  type TimerApi,
   type TriggerAction,
 } from "./watcher/scheduler"
-
-export type ChatMessageInput = Readonly<{
-  sessionID: string
-  agent?: string
-}>
-
-export type ChatMessageOutput = Readonly<{
-  parts: readonly Part[]
-}>
-
-export type SessionClient = Readonly<{
-  session: Readonly<{
-    get: (options: Readonly<{ path: Readonly<{ id: string }> }>) => Promise<Readonly<{
-      data?: Session
-      error?: SessionGetError
-    }>>
-  }>
-}>
-
-export type WatcherOptions<Timer> = Readonly<{
-  config: AdvisorConfig
-  log: Logger
-  clock: () => number
-  timers: TimerApi<Timer>
-  client: SessionClient
-  onPass: (sessionID: string, reason: PassReason) => Promise<void>
-}>
+import type { ChatMessageInput, ChatMessageOutput, WatcherOptions } from "./watcher/types"
+export type { ChatMessageInput, ChatMessageOutput, SessionClient, WatcherOptions } from "./watcher/types"
 
 type RootRecord = {
   directory: string
@@ -58,24 +24,29 @@ export class Watcher<Timer> {
   private readonly pendingSessionGets = new Map<string, Promise<void>>()
   private readonly ignoredRuntimeEventTypes = new Set<string>()
   private readonly scheduler: PassScheduler<Timer>
+  private readonly pendingTokens = new Map<string, symbol>()
+  private disposed = false
 
   constructor(private readonly options: WatcherOptions<Timer>) {
     this.scheduler = new PassScheduler(options)
   }
 
   dispose(): void {
-    for (const id of [...this.roots.keys(), ...this.advisedChildren.keys()]) this.forgetSession(id)
+    this.disposed = true
+    for (const id of [...this.roots.keys(), ...this.advisedChildren.keys()]) this.forgetSession(id, "disposed")
     this.children.clear()
     this.advisorSessions.clear()
+    this.pendingTokens.clear()
+    this.pendingSessionGets.clear()
   }
 
   markAdvisorSession(sessionID: string): void {
-    this.advisorSessions.add(sessionID)
+    remember(this.advisorSessions, sessionID, ROOT_LIMIT * 4)
     this.forgetSession(sessionID)
   }
 
   isWatched(sessionID: string): boolean {
-    return !this.advisorSessions.has(sessionID) && (
+    return !this.disposed && !this.advisorSessions.has(sessionID) && (
       this.roots.has(sessionID) || this.advisedChildren.has(sessionID)
     )
   }
@@ -89,6 +60,7 @@ export class Watcher<Timer> {
   }
 
   handleChatMessage(input: ChatMessageInput, output: ChatMessageOutput): void {
+    if (this.disposed) return
     if (input.agent?.startsWith("advisor-") === true) return
     const root = this.roots.get(input.sessionID)
     if (root === undefined || root.firstUserText !== undefined) return
@@ -102,6 +74,7 @@ export class Watcher<Timer> {
   }
 
   async handleEvent(event: Event): Promise<void> {
+    if (this.disposed) return
     const eventType: string = event.type
     switch (event.type) {
       case "session.created":
@@ -122,15 +95,15 @@ export class Watcher<Timer> {
       default:
         if (isIgnoredEventType(eventType)) return
         if (this.ignoredRuntimeEventTypes.has(eventType)) return
-        this.ignoredRuntimeEventTypes.add(eventType)
+        remember(this.ignoredRuntimeEventTypes, eventType, 100)
         await this.options.log.debug({ msg: "watcher runtime event ignored", type: eventType })
     }
   }
 
   private registerSession(info: Session): void {
-    if (this.advisorSessions.has(info.id)) return
+    if (this.disposed || this.advisorSessions.has(info.id)) return
     if (info.parentID !== undefined) {
-      this.children.add(info.id)
+      remember(this.children, info.id, ROOT_LIMIT * 4)
       this.roots.delete(info.id)
       return
     }
@@ -147,14 +120,14 @@ export class Watcher<Timer> {
     this.roots.delete(sessionID)
     this.roots.set(sessionID, root)
     while (this.roots.size > ROOT_LIMIT) {
-      const oldest = this.roots.keys().next().value
+      const oldest = [...this.roots.keys()].find((id) => !this.options.isPinned?.(id) && !this.scheduler.pending(id))
       if (oldest === undefined) return
       this.forgetSession(oldest)
     }
   }
 
   private handleMessage(info: Message): void {
-    if (this.advisorSessions.has(info.sessionID)) {
+    if (this.advisorSessions.has(info.sessionID) || (info.role === "assistant" && info.mode.startsWith("advisor-"))) {
       if (info.role === "assistant" && info.time.completed !== undefined) {
         this.logIgnoredTrigger(info.sessionID, "step")
       }
@@ -171,7 +144,13 @@ export class Watcher<Timer> {
     if (this.children.has(info.sessionID)) {
       const setting = this.options.config.advise_agents[info.mode]
       if (setting !== undefined && setting !== false) {
+        this.advisedChildren.delete(info.sessionID)
         this.advisedChildren.set(info.sessionID, info.mode)
+        while (this.advisedChildren.size > ROOT_LIMIT) {
+          const oldest = [...this.advisedChildren.keys()].find((id) => !this.options.isPinned?.(id) && !this.scheduler.pending(id))
+          if (oldest === undefined) break
+          this.forgetSession(oldest)
+        }
       }
     }
     if (info.time.completed === undefined) return
@@ -185,6 +164,7 @@ export class Watcher<Timer> {
   }
 
   private async handleIdle(sessionID: string): Promise<void> {
+    if (this.disposed) return
     if (this.advisorSessions.has(sessionID)) {
       this.logIgnoredTrigger(sessionID, "idle")
       return
@@ -204,14 +184,18 @@ export class Watcher<Timer> {
       await pending
       return
     }
+    if (this.pendingSessionGets.size >= ROOT_LIMIT) return
     const request = this.fetchUnknownSession(sessionID)
     this.pendingSessionGets.set(sessionID, request)
     await request
   }
 
   private async fetchUnknownSession(sessionID: string): Promise<void> {
+    const token = Symbol(sessionID)
+    this.pendingTokens.set(sessionID, token)
     try {
       const result = await this.options.client.session.get({ path: { id: sessionID } })
+      if (this.disposed || this.pendingTokens.get(sessionID) !== token) return
       if (result.data === undefined || result.error !== undefined) {
         await this.options.log.warn({ msg: "watcher.session.get.failed", sessionID, error: result.error })
         return
@@ -222,24 +206,31 @@ export class Watcher<Timer> {
     } catch (error) {
       await this.options.log.error({ msg: "watcher.session.get.failed", sessionID, error })
     } finally {
-      this.pendingSessionGets.delete(sessionID)
+      if (this.pendingTokens.get(sessionID) === token) {
+        this.pendingTokens.delete(sessionID)
+        this.pendingSessionGets.delete(sessionID)
+      }
     }
   }
 
-  private forgetSession(sessionID: string): void {
+  private forgetSession(sessionID: string, reason: "evicted" | "deleted" | "disposed" = "evicted"): void {
+    const watched = this.roots.has(sessionID) || this.advisedChildren.has(sessionID)
     this.roots.delete(sessionID)
     this.children.delete(sessionID)
     this.advisedChildren.delete(sessionID)
     this.scheduler.forget(sessionID)
+    this.pendingTokens.delete(sessionID)
+    this.pendingSessionGets.delete(sessionID)
+    if (watched) this.options.onForget?.(sessionID, reason)
   }
 
   private evictSession(sessionID: string): void {
     this.advisorSessions.delete(sessionID)
-    this.forgetSession(sessionID)
+    this.forgetSession(sessionID, "deleted")
   }
 
   private logIgnoredTrigger(sessionID: string, reason: PassReason): void {
     const action: TriggerAction = "ignored"
-    void this.options.log.info({ msg: "advisor trigger", sessionID, reason, action })
+    void this.options.log.debug({ msg: "advisor trigger", sessionID, reason, action })
   }
 }

@@ -1,13 +1,13 @@
 import type { Hooks, Plugin } from "@opencode-ai/plugin"
 import type { Config as SdkConfig } from "@opencode-ai/sdk"
+import { join } from "node:path"
 
-import packageMetadata from "../package.json" with { type: "json" }
 import { AdvisorRuntime } from "./advisor"
 import { TaskContexts } from "./advisor/context"
 import { loadConfig, resolveDataDir } from "./config"
 import { Deliverer } from "./deliver"
-import { createLogger, type Logger } from "./log"
-import { CooldownRegistry, displayName } from "./models"
+import { createLogger } from "./log"
+import { CooldownRegistry } from "./models"
 import { NoteStore } from "./notes"
 import { rosterFloors } from "./roster"
 import {
@@ -25,42 +25,15 @@ import {
 import { safe } from "./safe"
 import { Watcher } from "./watcher"
 import { checkpointTool } from "./plugin/checkpoint"
+import { createUsageLedger } from "./plugin/accounting"
+import { processAdmission, releaseProcessAdmission } from "./advisor/admission"
+import { createSessionHistory } from "./plugin/history"
+import { showRuntimeWarning } from "./plugin/warnings"
+import { ReviewJournal } from "./advisor/journal"
+import { buildIdentity } from "./identity"
+import { logStartup } from "./plugin/startup"
 
-export type AdvisorPluginInput = Readonly<{
-  client: AdvisorPluginClient
-  directory: string
-}>
-
-async function showRuntimeWarning(
-  client: AdvisorPluginClient,
-  log: Logger,
-  advisor: string,
-  message: string,
-): Promise<void> {
-  await log.warn({ msg: "advisor runtime warning", advisor, message })
-  try {
-    const result = await client.tui.showToast({
-      body: {
-        title: "Advisor · warning",
-        message: message.slice(0, 240),
-        variant: "warning",
-        duration: 8000,
-      },
-    })
-    if (!result.response.ok || result.error !== undefined) {
-      await log.debug({
-        msg: "advisor warning toast unavailable",
-        status: result.response.status,
-      })
-    }
-  } catch (error) {
-    const cause =
-      error instanceof Error
-        ? error
-        : new TypeError("unknown warning toast failure")
-    await log.debug({ msg: "advisor warning toast unavailable", error: cause })
-  }
-}
+export type AdvisorPluginInput = Readonly<{ client: AdvisorPluginClient; directory: string }>
 
 export async function createAdvisorHooks(
   input: AdvisorPluginInput,
@@ -75,7 +48,9 @@ export async function createAdvisorHooks(
       env: dependencies.environment,
       readFile: dependencies.readFile,
     })
-    log = dependencies.createLogger({ level: loaded.config.log_level })
+    log = dependencies.createLogger({ level: loaded.config.log_level,
+      path: join(resolveDataDir(dependencies.environment), "advisor.log"),
+      maxBytes: loaded.config.log_max_bytes, retention: loaded.config.log_retention })
     for (const warning of loaded.warnings) {
       await log.warn({
         msg: "advisor startup warning",
@@ -101,7 +76,11 @@ export async function createAdvisorHooks(
       clock: () => new Date(dependencies.clock()),
     })
     const cooldowns = new CooldownRegistry(dependencies.clock)
+    const usage = createUsageLedger(input.client, dataDir, input.directory, dependencies.clock)
+    const history = createSessionHistory(input.client, input.directory, dependencies.clock)
     const contexts = new TaskContexts(store, input.directory)
+    const journal = new ReviewJournal(dataDir, input.directory)
+    const identity = await buildIdentity(loaded.config, dependencies.clock())
     let watcher: Watcher<unknown> | undefined
     let disposed = false
     const isWatched = (sessionID: string) => !disposed && (watcher?.isWatched(sessionID) ?? false)
@@ -116,13 +95,20 @@ export async function createAdvisorHooks(
       ),
       cooldowns,
       store,
+      usage,
+      history,
+      journal,
+      identity,
+      admission: processAdmission(dataDir, loaded.config.max_concurrent_passes_per_provider),
       log,
       client: toAdvisorClient(input.client),
       directory: input.directory,
       clock: dependencies.clock,
+      monotonicClock: dependencies.monotonicClock,
       timers: dependencies.timers,
       readFile: dependencies.readFile,
       onAdvisorSession: (id) => watcher?.markAdvisorSession(id),
+      onResult: (sessionID, result) => disposed ? undefined : deliverer.deliver(sessionID, result.notes),
       captureReview: (sessionID, messages) => contexts.capture(sessionID, messages),
       onWarning: (advisor, message) =>
         showRuntimeWarning(input.client, log, advisor, message),
@@ -141,37 +127,36 @@ export async function createAdvisorHooks(
         watcher?.suppress(sessionID, milliseconds),
     })
     watcher = new Watcher<unknown>({
-      config: loaded.config,
+      config: { ...loaded.config, cooldown_ms: 0 },
+      dispatchOnly: true,
       log,
       clock: dependencies.clock,
       timers: dependencies.timers,
       client: toSessionClient(input.client),
+      isPinned: (root) => runtime.isPinned(root),
+      onForget: (root) => { runtime.forget(root); history.forget(root); contexts.forget(root); deliverer.forget(root) },
       onPass: async (sessionID, reason) => {
         if (disposed) return
         const firstUserText = watcher?.firstUserText(sessionID)
-        await runtime.runPass(sessionID, reason, {
+        runtime.notify(sessionID, reason, {
           ...(firstUserText === undefined ? {} : { firstUserText }),
-          onResult: (result) => disposed ? undefined : deliverer.deliver(sessionID, result.notes),
         })
       },
     })
 
-    await log.info({
-      msg: "advisor started",
-      version: packageMetadata.version,
-      rosterSize: roster.length,
-      advisors: roster.map((entry) => ({
-        id: entry.agentId,
-        model: displayName(entry.model, new Map()),
-      })),
-      dataDir,
-    })
-
+    await logStartup(log, identity, roster, dataDir)
+    await runtime.start()
     return {
       tool: {
         advisor_checkpoint: checkpointTool({
           client: input.client, config: loaded.config, contexts, log, store, directory: input.directory,
-          isWatched,
+          isWatched, history, recover: (root) => runtime.recover(root),
+          onTask: async (root, task, stopped) => {
+            if (!isWatched(root)) return
+            if (task === "replace") { runtime.forget(root); deliverer.forget(root) }
+            if (stopped) runtime.pause(root)
+            else if (task === "resume") await runtime.resume(root)
+          },
         }),
       },
       config: safe(log, "config", async (config) => {
@@ -184,18 +169,37 @@ export async function createAdvisorHooks(
         if (event.type === "server.instance.disposed" && event.properties.directory === input.directory) {
           disposed = true
           watcher.dispose()
-          await store.close()
+          history.clear()
+          contexts.clear()
+          await runtime.dispose()
+          releaseProcessAdmission(dataDir, loaded.config.max_concurrent_passes_per_provider)
+          for (const [resource, close] of [
+            ["journal", () => journal.close()], ["usage", () => usage.close()], ["notes", () => store.close()],
+          ] as const) {
+            try { await close() } catch (error) {
+              await log.warn({ msg: "advisor shutdown cleanup failed", resource, error }).catch(() => {})
+            }
+          }
+          await log.close?.()
           return
         }
         if (disposed) return
-        if (event.type === "message.updated" && event.properties.info.role === "user") contexts.user(event.properties.info)
-        await deliverer.onEvent(event)
+        history.observe(event)
+        runtime.observe(event)
+        if (event.type === "message.updated") {
+          const info = event.properties.info
+          if (usage.tracks(info.sessionID) || (info.role === "assistant" ? info.mode : info.agent).startsWith("advisor-")) await usage.observe(info)
+        }
         await watcher.handleEvent(event)
+        if (event.type === "message.updated" && event.properties.info.role === "user" &&
+          isWatched(event.properties.info.sessionID)) contexts.user(event.properties.info)
+        await deliverer.onEvent(event)
       }),
       "chat.message": safe(log, "chat.message", async (chatInput, output) => {
         if (chatInput.agent?.startsWith("advisor-") === true) return
         deliverer.onUserMessage(output.message)
         contexts.user(output.message)
+        history.message(output.message, output.parts)
         watcher.handleChatMessage(chatInput, output)
       }),
       "experimental.chat.messages.transform": safe(
@@ -217,12 +221,12 @@ export async function createAdvisorHooks(
         "experimental.session.compacting",
         async (compactingInput) => {
           deliverer.markCompacting(compactingInput.sessionID)
+          history.invalidate(compactingInput.sessionID)
         },
       ),
     } satisfies Hooks
   } catch (error) {
-    const cause =
-      error instanceof Error ? error : new TypeError("unknown advisor startup failure")
+    const cause = error instanceof Error ? error : new TypeError("unknown advisor startup failure")
     await log.error({ msg: "advisor startup failed", source: "startup", error: cause })
     return {}
   }
@@ -230,13 +234,9 @@ export async function createAdvisorHooks(
 
 export const server: Plugin = async ({ client, directory }) => {
   try {
-    return await createAdvisorHooks({
-      client: adaptPluginClient(client),
-      directory,
-    })
+    return await createAdvisorHooks({ client: adaptPluginClient(client), directory })
   } catch (error) {
-    const cause =
-      error instanceof Error ? error : new TypeError("unknown advisor factory failure")
+    const cause = error instanceof Error ? error : new TypeError("unknown advisor factory failure")
     await createLogger({ level: "info" }).error({
       msg: "advisor startup failed",
       source: "factory",

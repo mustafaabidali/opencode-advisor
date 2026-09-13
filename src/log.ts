@@ -1,6 +1,7 @@
-import { appendFile, mkdir } from "node:fs/promises"
 import { homedir } from "node:os"
-import { dirname, join } from "node:path"
+import { join } from "node:path"
+import { LogBuffer } from "./log/buffer"
+import { rotatingLog } from "./log/file"
 
 export type LogLevel = "debug" | "info" | "warn" | "error"
 
@@ -14,11 +15,15 @@ export type Logger = Readonly<{
   info: (fields: LogFields) => Promise<void>
   warn: (fields: LogFields) => Promise<void>
   error: (fields: LogFields) => Promise<void>
+  flush?: () => Promise<void>
+  close?: () => Promise<void>
 }>
 
 export type LoggerOptions = Readonly<{
   level: LogLevel
   path?: string
+  maxBytes?: number
+  retention?: number
 }>
 
 const DEFAULT_LOG_PATH = join(
@@ -64,12 +69,13 @@ function serializeLogValue(_key: string, value: unknown): unknown {
 
 export function createLogger(options: LoggerOptions): Logger {
   const path = options.path ?? DEFAULT_LOG_PATH
+  const buffer = new LogBuffer(rotatingLog(path, options.maxBytes ?? 10 * 1024 * 1024, options.retention ?? 3))
 
   const write = async (level: LogLevel, fields: LogFields): Promise<void> => {
     if (LEVEL_PRIORITY[level] < LEVEL_PRIORITY[options.level]) return
 
     try {
-      const line = JSON.stringify(
+      let line = JSON.stringify(
         {
           time: new Date().toISOString(),
           level,
@@ -77,8 +83,12 @@ export function createLogger(options: LoggerOptions): Logger {
         },
         serializeLogValue,
       )
-      await mkdir(dirname(path), { recursive: true })
-      await appendFile(path, `${line}\n`, "utf8")
+      if (Buffer.byteLength(line) > 16 * 1024) {
+        line = JSON.stringify({ time: new Date().toISOString(), level, msg: redact(fields.msg).slice(0, 500),
+          truncated: true, detail: line.slice(0, 3000) })
+      }
+      buffer.add(`${line}\n`)
+      if (level === "warn" || level === "error") await buffer.flush()
     } catch {
       // Logging is best-effort: a sink failure must never break an opencode session.
     }
@@ -89,5 +99,7 @@ export function createLogger(options: LoggerOptions): Logger {
     info: (fields) => write("info", fields),
     warn: (fields) => write("warn", fields),
     error: (fields) => write("error", fields),
+    flush: () => buffer.flush(),
+    close: () => buffer.close(),
   }
 }

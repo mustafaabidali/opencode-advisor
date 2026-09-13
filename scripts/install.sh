@@ -93,8 +93,21 @@ if [[ ! -e "$CONFIG_FILE" && ! -L "$CONFIG_FILE" ]]; then
   // Number of later user turns for which an undelivered note remains injectable.
   "note_ttl_turns": 2,
 
-  // Maximum duration of one advisor pass before its child session is aborted.
+  // Shared execution deadline: preparation, child creation, requests, refresh, and fallback.
   "pass_timeout_ms": 180000,
+
+  // Remote cancellation grace. An unconfirmed abort keeps the lane blocked for reconciliation.
+  "abort_grace_ms": 2000,
+  "min_fallback_budget_ms": 30000,
+
+  // Fair per-provider admission in this process/data directory; 0 preserves unlimited concurrency.
+  "max_concurrent_passes_per_provider": 0,
+  "admission_timeout_ms": 180000,
+
+  // Rotate between passes at this explicit soft token budget, or a fraction of known model capacity.
+  "context_budget_tokens": 0,
+  "context_budget_fraction": 0.7,
+  "context_carry_chars": 24000,
 
   // Maximum card age before it is marked expired and its pending pointer is removed.
   "pending_ttl_ms": 600000,
@@ -134,7 +147,9 @@ if [[ ! -e "$CONFIG_FILE" && ! -L "$CONFIG_FILE" ]]; then
   ],
 
   // File-log threshold: "debug", "info", "warn", or "error".
-  "log_level": "info"
+  "log_level": "info",
+  "log_max_bytes": 10485760,
+  "log_retention": 3
 }
 
 // WATCHDOG.yml is loaded when OpenCode starts. Restart OpenCode after roster edits.
@@ -157,4 +172,4 @@ else
   printf 'kept existing %s\n' "$COMMAND_FILE"
 fi
 
-printf 'restart OpenCode to load the advisor plugin, command, or roster changes\n'
+printf 'restart all OpenCode instances to load the plugin and receipt/accounting schemas; use advisor index --all for legacy reports\n'

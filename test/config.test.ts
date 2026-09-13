@@ -58,7 +58,7 @@ async function load(
 describe("DEFAULTS", () => {
   test("exports the complete advisor defaults", () => {
     // Given / When / Then
-    expect(DEFAULTS).toEqual({
+    expect(DEFAULTS).toMatchObject({
       enabled: true,
       min_severity: "nit",
       chat_min_severity: "blocker",

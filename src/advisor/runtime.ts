@@ -1,229 +1,239 @@
-import type { Config, Message, Part } from "@opencode-ai/sdk"
-import type { AdvisorConfig } from "../config"
-import { renderDelta, sliceDelta, type Cursor, type TranscriptMessage } from "../delta"
-import { redact, type Logger } from "../log"
-import type { CooldownRegistry, ModelCatalog } from "../models"
-import type { NoteStore, ReviewContext, StateSnapshot } from "../notes"
-import { ADVISOR_SYSTEM_PROMPT, buildPassPrompt } from "../prompts"
-import {
-  DELIVERY_AGENT_ID,
-  deliveryAgentConfig,
-  toAgentConfig,
-  toFallbackAgentConfig,
-  type AdvisorEntry,
-} from "../roster"
-import {
-  AdvisorCallError,
-  executeAdvisorPass,
-  type AdvisorStore,
-  type ApiResult,
-  type AdvisorTimers,
-  type PassResult,
-  type PromptCall,
-  type PromptResponse,
-} from "./pass"
-import { buildSnapshot, type AdvisorStats } from "./snapshot"
-import { shouldReview } from "./trigger"
-import { readProjectFiles } from "./files"
-export type ResolvedEntry = AdvisorEntry & Readonly<{ rosterInstructions?: string; watchdogMd?: string }>; type MessageResponse = readonly Readonly<{ info: Message; parts: readonly Part[] }>[]
-export type AdvisorClient = Readonly<{
-  session: Readonly<{
-    create: (call: Readonly<{ query: Readonly<{ directory: string }>; body: Readonly<{ parentID: string; title: string }> }>) => Promise<ApiResult<Readonly<{ id: string }>>>
-    messages: (call: Readonly<{ path: Readonly<{ id: string }>; query: Readonly<{ directory: string }> }>) => Promise<ApiResult<MessageResponse>>
-    prompt: (call: PromptCall) => Promise<ApiResult<PromptResponse>>; abort: (call: Readonly<{ path: Readonly<{ id: string }> }>) => Promise<ApiResult<boolean>>
-  }>
-}>
-export type AdvisorRuntimeOptions = Readonly<{
-  config: AdvisorConfig; roster: readonly ResolvedEntry[]; catalog: ModelCatalog | (() => Promise<ModelCatalog>)
-  cooldowns: CooldownRegistry; store: AdvisorStore | NoteStore
-  log: Logger; client: AdvisorClient
-  directory: string; clock: () => number; timers: AdvisorTimers
-  readFile: (path: string) => Promise<string>; onAdvisorSession: (id: string) => void; onWarning: (advisorSlug: string, message: string) => void | Promise<void>
-  captureReview?: (sessionID: string, messages: readonly TranscriptMessage[]) => Promise<ReviewContext>
-}>
-export type RunPassContext = Readonly<{
-  firstUserText?: string
-  onResult?: (result: PassResult) => void | Promise<void>
-}>
-const EMPTY_CURSOR = {} as const satisfies Cursor
+import type { Config, Event } from "@opencode-ai/sdk"
+import type { ModelCatalog } from "../models"
+import { DELIVERY_AGENT_ID, type AdvisorEntry } from "../roster"
+import { AdvisorCallError, type PassResult } from "./pass"
+import { recordStats, type AdvisorStats } from "./snapshot"
+import { Lifetime, LifetimeExpired } from "./lifetime"
+import { within } from "../async"
+import { ReviewLane, type PreparedReview } from "./lane"
+import { ReviewScheduler } from "./scheduling"
+import { ProviderAdmission } from "./admission"
+import { UpstreamFailures } from "./upstream"
+import { RuntimeStatus } from "./status"
+import { registerAgents } from "./registration"
+import { resumedNotes } from "./resume"
+import type { AdvisorRuntimeOptions, MessageResponse, ResolvedEntry, RunPassContext } from "./runtime-types"
+export type { AdvisorClient, AdvisorRuntimeOptions, ResolvedEntry, RunPassContext } from "./runtime-types"
+
 export class AdvisorRuntime {
-  readonly #sessions = new Map<string, string>(); readonly #cursors = new Map<string, Cursor>(); readonly #primed = new Set<string>()
-  readonly #inFlight = new Set<string>(); readonly #warnedNoModel = new Set<string>()
-  readonly #watched = new Set<string>(); readonly #stats = new Map<string, AdvisorStats>(); #catalogPromise?: Promise<ModelCatalog>; constructor(private readonly options: AdvisorRuntimeOptions) {}
-  async registerAgents(cfg: Config): Promise<void> {
-    cfg.agent ??= {}
-    for (const entry of this.options.roster.filter(({ enabled }) => enabled)) {
-      await this.#register(cfg, entry.agentId, toAgentConfig(entry, ADVISOR_SYSTEM_PROMPT))
-      const fallback = toFallbackAgentConfig(entry, ADVISOR_SYSTEM_PROMPT)
-      if (fallback !== undefined) await this.#register(cfg, `${entry.agentId}-fb`, fallback)
-    }
-    await this.#register(cfg, DELIVERY_AGENT_ID, deliveryAgentConfig())
+  readonly #lanes = new Map<string, ReviewLane>()
+  readonly #watched = new Set<string>()
+  readonly #stats = new Map<string, AdvisorStats>()
+  readonly #lifetimes = new Map<Lifetime, string>()
+  readonly #running = new Set<Promise<PassResult[]>>()
+  readonly #contexts = new Map<string, RunPassContext>()
+  readonly #paused = new Set<string>()
+  readonly #epochs = new Map<string, symbol>()
+  readonly #deliveries = new Set<Promise<void>>()
+  readonly #status: RuntimeStatus
+  #catalogLoading: Promise<ModelCatalog> | undefined
+  #disposed = false
+  readonly #scheduler: ReviewScheduler
+  constructor(private readonly options: AdvisorRuntimeOptions) {
+    this.options = { ...options, admission: options.admission ?? new ProviderAdmission(options.config.max_concurrent_passes_per_provider),
+      upstream: options.upstream ?? new UpstreamFailures(options.config.content_filter_patterns) }
+    this.#scheduler = new ReviewScheduler(options, (root, reason, context) => this.runPass(root, reason, context))
+    this.#status = new RuntimeStatus(this.options, this.#stats, () => ({
+      watched_sessions: [...this.#watched], execution: [...this.#lanes.values()].map((lane) => lane.status),
+    }))
   }
-  async #register(cfg: Config, key: string, value: NonNullable<Config["agent"]>[string]): Promise<void> {
-    if (cfg.agent?.[key] !== undefined) {
-      await this.options.log.warn({ msg: "advisor agent registration skipped existing key", agent: key }); return
-    }
-    if (value !== undefined && cfg.agent !== undefined) cfg.agent[key] = value
+
+  notify(root: string, reason: "step" | "idle", context: RunPassContext = {}): void {
+    if (this.#disposed) return
+    context = this.#scope(root, context)
+    if (!this.#disposed && !this.#paused.has(root)) this.#scheduler.notify(root, reason, context)
   }
-  async ensureSession(watchedID: string, entry: AdvisorEntry): Promise<string> {
-    const key = this.#key(watchedID, entry.slug)
-    const cached = this.#sessions.get(key)
-    if (cached !== undefined) return cached
-    const result = await this.options.client.session.create({
-      query: { directory: this.options.directory },
-      body: { parentID: watchedID, title: `advisor:${entry.slug}` },
-    })
-    if (result.error !== undefined || result.data === undefined || (result.response?.status ?? 200) >= 400) {
-      throw new AdvisorCallError("advisor session creation failed", result.response?.status, result.error)
-    }
-    this.#sessions.set(key, result.data.id)
-    this.options.onAdvisorSession(result.data.id)
-    return result.data.id
+  observe(event: Event): void { if (!this.#disposed) this.options.upstream?.observe(event) }
+  start(): Promise<void> { return this.#status.write() }
+
+  registerAgents(cfg: Config): Promise<void> { return registerAgents(cfg, this.options) }
+  ensureSession(watchedID: string, entry: AdvisorEntry): Promise<string> {
+    return this.#lane(watchedID, entry).ensureSession()
   }
-  async runPass(watchedID: string, _reason: "step" | "idle", context: RunPassContext = {}): Promise<PassResult[]> {
+
+  runPass(watchedID: string, _reason: "step" | "idle", context: RunPassContext = {}): Promise<PassResult[]> {
+    if (this.#disposed || this.#paused.has(watchedID)) return Promise.resolve([])
+    context = this.#scope(watchedID, context)
+    const work = this.#run(watchedID, context)
+    this.#running.add(work)
+    void work.finally(() => this.#running.delete(work)).catch(() => {})
+    return work
+  }
+  async dispose(): Promise<void> {
+    this.#disposed = true
+    this.#scheduler.dispose()
+    this.#status.close()
+    const retiring = [...this.#lanes.values()].map((lane) => lane.retire())
+    for (const lifetime of this.#lifetimes.keys()) lifetime.cancel()
+    await within(Promise.allSettled([...this.#running, ...this.#deliveries, ...retiring]), this.options.config.abort_grace_ms * 2, this.options.timers)
+    this.#lanes.clear()
+    this.#contexts.clear()
+    this.#watched.clear()
+    this.#paused.clear()
+    this.#epochs.clear()
+  }
+  #scope(root: string, context: RunPassContext): RunPassContext {
+    const epoch = this.#epochs.get(root) ?? Symbol(root)
+    this.#epochs.set(root, epoch)
+    const scoped = { ...this.#contexts.get(root), ...context, epoch }
+    const { advisorSlug, detached, ...rootContext } = scoped
+    this.#contexts.set(root, rootContext)
+    return scoped
+  }
+  get metrics() { return { lanes: this.#lanes.size, roots: this.#watched.size, active: this.#lifetimes.size,
+    deliveries: this.#deliveries.size } }
+  isPinned(root: string): boolean {
+    return this.#scheduler.pending(root) || [...this.#lifetimes.values()].includes(root) ||
+      [...this.#lanes.values()].some((lane) => lane.root === root && lane.pinned)
+  }
+  pause(root: string): void {
+    if (this.#disposed) return
+    this.#paused.add(root)
+    this.#scheduler.forget(root)
+  }
+  async resume(root: string): Promise<void> {
+    if (this.#disposed) return
+    this.#paused.delete(root)
+    const context = this.#scope(root, this.#contexts.get(root) ?? {})
+    const notes = await resumedNotes(this.options.store, this.options.directory, root)
+    if (this.#disposed || context.epoch !== this.#epochs.get(root)) return
+    await this.#emit(root, { slug: "resumed", outcome: "ok", notes }, context)
+    this.notify(root, "idle", context)
+  }
+  forget(root: string): void {
+    this.#scheduler.forget(root)
+    for (const [key, lane] of this.#lanes) if (lane.root === root) {
+      void lane.retire()
+      this.#lanes.delete(key)
+    }
+    for (const [lifetime, id] of this.#lifetimes) if (id === root) lifetime.cancel()
+    this.#contexts.delete(root)
+    this.#watched.delete(root)
+    this.#paused.delete(root)
+    this.#epochs.delete(root)
+    this.options.history?.forget(root)
+  }
+  async #run(watchedID: string, context: RunPassContext): Promise<PassResult[]> {
+    const selected = this.options.roster.filter((entry) => entry.enabled &&
+      (context.advisorSlug === undefined || entry.slug === context.advisorSlug))
+    if (selected.length > 1 && this.options.config.max_concurrent_passes_per_provider > 0) {
+      const results = await Promise.all(selected.map((entry) => this.runPass(watchedID, "idle", { ...context, advisorSlug: entry.slug })))
+      return results.flat()
+    }
+    const lifetime = new Lifetime(this.options.config.pass_timeout_ms,
+      this.options.monotonicClock ?? this.options.clock, this.options.timers)
+    this.#lifetimes.set(lifetime, watchedID)
+    try {
+      if (!this.#watched.has(watchedID) && this.options.store.readTask !== undefined) {
+        const task = await lifetime.run(() => this.options.store.readTask?.(this.options.directory, watchedID) ?? Promise.resolve(undefined))
+        if (task?.stopped) { this.pause(watchedID); return [] }
+      }
+      for (const entry of selected) {
+        if (this.#disposed || this.#paused.has(watchedID) || context.epoch !== this.#epochs.get(watchedID)) return []
+        await lifetime.run(() => this.#lane(watchedID, entry).recover())
+      }
+      if (this.#disposed || this.#paused.has(watchedID) || context.epoch !== this.#epochs.get(watchedID)) return []
+      if (selected.every((entry) => this.#lane(watchedID, entry).busy)) { await this.#status.write(); return [] }
+      return await this.#perform(watchedID, selected, context, lifetime)
+    } catch (error) {
+      if (!(error instanceof LifetimeExpired)) throw error
+      this.options.history?.forget(watchedID)
+      return selected.map((entry) => ({ slug: entry.slug, outcome: "timeout", notes: [], cancellation: "not_sent" }))
+    } finally {
+      lifetime.close()
+      this.#lifetimes.delete(lifetime)
+    }
+  }
+  async #perform(root: string, entries: readonly ResolvedEntry[], context: RunPassContext,
+    lifetime: Lifetime): Promise<PassResult[]> {
     let messages: MessageResponse
     try {
-      const response = await this.options.client.session.messages({
-        path: { id: watchedID },
-        query: { directory: this.options.directory },
-      })
+      const history = this.options.history
+      const response = history === undefined ? await lifetime.run(() => this.options.client.session.messages({
+        path: { id: root }, query: { directory: this.options.directory },
+      })) : { data: await lifetime.run(() => history.read(root)), error: undefined, response: { status: 200 } }
       if (response.error !== undefined || response.data === undefined || (response.response?.status ?? 200) >= 400) {
         throw new AdvisorCallError("watched session messages failed", response.response?.status, response.error)
       }
       messages = response.data
     } catch (error) {
-      await this.options.log.error({ msg: "advisor pass could not fetch messages", watchedID, error })
+      if (error instanceof LifetimeExpired) throw error
+      await this.options.log.error({ msg: "advisor pass could not fetch messages", watchedID: root, error })
       return []
     }
-    this.#watched.add(watchedID)
-    const review = await this.options.captureReview?.(watchedID, messages)
-    const catalog = await this.#catalog()
-    const files = await readProjectFiles(this.options.directory, this.options.readFile, this.options.log)
-    const originalRequest = context.firstUserText ?? this.#firstUserText(messages)
-    const latestRequest = this.#latestUserText(messages)
-    const settled = await Promise.allSettled(
-      this.options.roster.filter(({ enabled }) => enabled).map(async (entry) => {
-        const result = await this.#runEntry(watchedID, entry, messages, originalRequest, latestRequest, catalog, files, review)
-        if (result !== undefined) {
-          try { await context.onResult?.(result) } catch (error) {
-            await this.options.log.warn({ msg: "advisor result delivery failed", watchedID, advisor: entry.slug, error })
-          }
-        }
-        return result
-      }),
-    )
+    if (lifetime.invalidated) throw new LifetimeExpired("cancelled")
+    this.#watched.add(root)
+    let preparing: Promise<PreparedReview> | undefined
+    const prepare = () => preparing ??= (async () => {
+      const [catalog, review] = await Promise.all([
+        this.#catalog(),
+        this.options.captureReview?.(root, messages),
+      ])
+      return { catalog, ...(review === undefined ? {} : { review }) }
+    })()
+    const users = messages.filter(({ info }) => info.role === "user" &&
+      info.agent !== DELIVERY_AGENT_ID && !info.id.startsWith("adv_"))
+    const text = (message: MessageResponse[number] | undefined) =>
+      message?.parts.filter((part) => part.type === "text").map((part) => part.text).join("\n")
+    const original = context.firstUserText ?? text(users[0]) ?? ""
+    const latest = text(users.at(-1))
+    const settled = await Promise.allSettled(entries.map(async (entry) => {
+      let result: PassResult | undefined
+      try {
+        result = await this.#lane(root, entry).run(messages, original, latest, prepare, lifetime,
+          (result) => this.#emit(root, result, context))
+      } catch (error) {
+        if (!(error instanceof LifetimeExpired)) throw error
+        result = { slug: entry.slug, outcome: "timeout", notes: [], cancellation: "not_sent" }
+      }
+      if (result !== undefined && !this.#disposed) await this.#emit(root, result, context)
+      return result
+    }))
     const results: PassResult[] = []
     for (const result of settled) {
       if (result.status === "fulfilled") {
         if (result.value !== undefined) results.push(result.value)
-      } else {
-        await this.options.log.error({ msg: "advisor pass failed unexpectedly", watchedID, error: result.reason })
-      }
+      } else await this.options.log.error({ msg: "advisor pass failed unexpectedly", watchedID: root, error: result.reason })
     }
-    await this.options.store.writeState(this.options.directory, this.#snapshot(catalog))
+    await this.#status.write()
     return results
   }
-  async #runEntry(watchedID: string, entry: ResolvedEntry, messages: MessageResponse,
-    originalRequest: string, latestRequest: string | undefined, catalog: ModelCatalog,
-    files: Readonly<{ agentsMd?: string; contextMd?: string }>, review?: ReviewContext): Promise<PassResult | undefined> {
-    const key = this.#key(watchedID, entry.slug)
-    if (this.#inFlight.has(key)) return undefined
-    const sliced = sliceDelta(messages satisfies readonly TranscriptMessage[], this.#cursors.get(key) ?? EMPTY_CURSOR)
-    if (sliced.delta.length > 0 && !shouldReview(entry.when, sliced.delta, this.options.directory)) {
-      await this.options.log.info({ msg: "advisor pass skipped", watchedID, advisor: entry.slug, reason: "no_trigger" })
-      return undefined
-    }
-    const delta = renderDelta(sliced.delta, { maxChars: this.options.config.max_delta_chars, redact })
-    const stats = this.#stats.get(entry.slug)
-    const promptInput = {
-      originalRequest,
-      ...(latestRequest === undefined ? {} : { latestRequest }),
-      delta,
-      passIndex: (stats?.passes ?? 0) + 1,
-      ...(entry.rosterInstructions === undefined ? {} : { rosterInstructions: entry.rosterInstructions }),
-      ...(entry.watchdogMd === undefined ? {} : { watchdogMd: entry.watchdogMd }),
-      ...(entry.instructions === undefined ? {} : { entryInstructions: entry.instructions }),
-      ...files,
-    }
-    const primingPrompt = buildPassPrompt({ ...promptInput, isFirstPass: true })
-    const continuationPrompt = buildPassPrompt({ ...promptInput, isFirstPass: false })
-    if (primingPrompt === null || continuationPrompt === null) return undefined
-    this.#inFlight.add(key)
-    try {
-      const advisorSession = await this.ensureSession(watchedID, entry)
-      let passCost = 0
-      const store = this.options.store
-      const prompted = new Set<string>()
-      const result = await executeAdvisorPass({
-        config: this.options.config,
-        entry,
-        catalog,
-        cooldowns: this.options.cooldowns,
-        store: {
-          writeNote: (note) => store.writeNote({ ...note, ...(review === undefined ? {} : { review }) }),
-          appendTranscript: async (root, record) => { passCost += record.cost; await store.appendTranscript(root, record) },
-          writeState: (cwd, snapshot) => store.writeState(cwd, snapshot) },
-        log: this.options.log,
-        client: {
-          prompt: this.options.client.session.prompt,
-          abort: this.options.client.session.abort,
-        },
-        directory: this.options.directory,
-        watchedID,
-        advisorSession,
-        prompt: (sessionID) => { prompted.add(sessionID); return this.#primed.has(sessionID) ? continuationPrompt : primingPrompt },
-        clock: this.options.clock,
-        timers: this.options.timers,
-        refreshSession: async () => {
-          this.#sessions.delete(key)
-          return this.ensureSession(watchedID, entry)
-        },
-        onWarning: (slug, message) => this.#warning(watchedID, slug, message),
-      })
-      if (["ok", "silent", "fallback", "quarantined"].includes(result.outcome)) {
-        this.#cursors.set(key, sliced.next)
-        this.#warnedNoModel.delete(key)
-        for (const sessionID of prompted) this.#primed.add(sessionID)
+  async #emit(root: string, result: PassResult, context: RunPassContext): Promise<void> {
+    if (this.#disposed || context.epoch !== this.#epochs.get(root)) return
+    const deliver = (async () => {
+      if (this.#paused.has(root)) return
+      const handler = context.onResult ?? ((result: PassResult) => this.options.onResult?.(root, result))
+      try { await handler(result) } catch (error) {
+        await this.options.log.warn({ msg: "advisor result delivery failed", watchedID: root, advisor: result.slug, error })
       }
-      this.#recordStats(entry.slug, result, passCost)
-      return result
-    } finally {
-      this.#inFlight.delete(key)
-    }
+    })()
+    this.#deliveries.add(deliver)
+    void deliver.finally(() => this.#deliveries.delete(deliver)).catch(() => {})
+    if (!context.detached) await deliver
   }
-  async #warning(watchedID: string, slug: string, message: string): Promise<void> {
-    const key = this.#key(watchedID, slug)
-    if (message.startsWith("No advisor model")) {
-      if (this.#warnedNoModel.has(key)) return
-      this.#warnedNoModel.add(key)
+  async recover(root: string): Promise<void> {
+    for (const lane of this.#lanes.values()) if (lane.root === root) {
+      await lane.recover(true)
     }
-    await this.options.onWarning(slug, message)
+    await this.#status.write()
   }
-  #recordStats(slug: string, result: PassResult, passCost: number): void {
-    const previous = this.#stats.get(slug)
-    this.#stats.set(slug, {
-      passes: (previous?.passes ?? 0) + 1,
-      notes: (previous?.notes ?? 0) + result.notes.length,
-      cost: (previous?.cost ?? 0) + passCost,
-      lastPassAt: new Date(this.options.clock()).toISOString(),
-      lastOutcome: result.outcome,
-    })
+  #lane(root: string, entry: ResolvedEntry): ReviewLane {
+    const key = `${root}\u0000${entry.slug}`
+    let lane = this.#lanes.get(key)
+    if (lane === undefined) {
+      lane = new ReviewLane(root, entry, this.options,
+        (result, cost, count) => recordStats(this.#stats, entry.slug, result, cost, count, this.options.clock()),
+        () => (this.#stats.get(entry.slug)?.passes ?? 0) + 1, () => { void this.#status.write() },
+        (result) => this.#emit(root, result, this.#contexts.get(root) ?? {}))
+      this.#lanes.set(key, lane)
+    }
+    return lane
   }
   async #catalog(): Promise<ModelCatalog> {
-    if (typeof this.options.catalog !== "function") return this.options.catalog
-    this.#catalogPromise ??= this.options.catalog()
-    return this.#catalogPromise
-  }
-  #firstUserText(messages: MessageResponse): string {
-    const first = messages.find(({ info }) => info.role === "user"); return first?.parts.filter((part) => part.type === "text").map((part) => part.text).join("\n") ?? ""
-  }
-  #latestUserText(messages: MessageResponse): string | undefined {
-    const latest = messages.findLast(({ info }) => info.role === "user" && info.agent !== DELIVERY_AGENT_ID && !info.id.startsWith("adv_")); return latest?.parts.filter((part) => part.type === "text").map((part) => part.text).join("\n")
-  }
-  #snapshot(catalog: ModelCatalog): StateSnapshot {
-    return buildSnapshot({ roster: this.options.roster, stats: this.#stats, cooldowns: this.options.cooldowns, catalog, watched: this.#watched, now: this.options.clock() })
-  }
-  #key(watchedID: string, slug: string): string {
-    return `${watchedID}\u0000${slug}`
+    if (typeof this.options.catalog !== "function") { this.#status.catalog(this.options.catalog); return this.options.catalog }
+    const loading = this.#catalogLoading ??= this.options.catalog()
+    try { const catalog = await loading; this.#status.catalog(catalog); return catalog } finally {
+      if (this.#catalogLoading === loading) this.#catalogLoading = undefined
+    }
   }
 }

@@ -15,6 +15,17 @@ function user(id: string): UserMessage {
   }
 }
 
+test("concurrent captures share unchanged durable state and forgetting a root prevents resurrection", async () => {
+  let writes = 0
+  const contexts = new TaskContexts({ readTask: async () => undefined, writeTask: async () => { writes++ } }, "/project")
+  const messages = [{ info: user("request"), parts: [] }]
+  await Promise.all([contexts.capture("root", messages), contexts.capture("root", messages)])
+  await contexts.capture("root", messages)
+  expect(writes).toBe(1)
+  contexts.forget("root")
+  expect(contexts.current("root")).toEqual({})
+})
+
 test("a status question preserves the task; explicit replacement persists across restart", async () => {
   const dataDir = await mkdtemp(join(tmpdir(), "advisor-context-"))
   try {

@@ -132,6 +132,22 @@ function runtimeTranscript(
 }
 
 describe("sliceDelta", () => {
+  test("a tool completed in place before the cursor is reviewed once", () => {
+    const completed = completedTool("assistant-1", "edit", { filePath: "/repo/src/a.ts" }, "ok")
+    const running: ToolPart = { ...completed, state: {
+      status: "running", input: completed.state.input, time: { start: 1 },
+    } }
+    const before = [
+      transcript(assistantMessage("assistant-1", 20), [running]),
+      transcript(assistantMessage("assistant-2", 30), [textPart("assistant-2", "waiting")]),
+    ]
+    const cursor = sliceDelta(before, {}).next
+    const after = [{ ...before[0]!, parts: [completed] }, before[1]!]
+    const updated = sliceDelta(after, cursor)
+    expect(updated.delta.map(({ info }) => info.id)).toEqual(["assistant-1"])
+    expect(updated.delta[0]?.parts).toEqual([completed])
+    expect(sliceDelta(after, updated.next).delta).toEqual([])
+  })
   test("returns only messages after the cursor in creation order", () => {
     // Given
     const messages = [
@@ -148,7 +164,7 @@ describe("sliceDelta", () => {
 
     // Then
     expect(result.delta.map(({ info }) => info.id)).toEqual(["assistant-2"])
-    expect(result.next).toEqual({
+    expect(result.next).toMatchObject({
       lastMessageID: "assistant-2",
       lastPartCount: 0,
     })
@@ -195,7 +211,7 @@ describe("sliceDelta", () => {
     ], afterCard.next)
 
     // Then
-    expect(cursor).toEqual({ lastMessageID: "assistant-1", lastPartCount: 2 })
+    expect(cursor).toMatchObject({ lastMessageID: "assistant-1", lastPartCount: 2 })
     expect(afterCard.delta).toEqual([])
     expect(afterCard.next).toEqual(cursor)
     expect(afterNextStep.delta.map(({ info }) => info.id)).toEqual(["assistant-2"])

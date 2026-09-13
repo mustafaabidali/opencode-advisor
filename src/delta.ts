@@ -1,9 +1,6 @@
 import type { Message, Part, ToolPart } from "@opencode-ai/sdk"
-
-export type Cursor = Readonly<{
-  lastMessageID?: string
-  lastPartCount?: number
-}>
+import { changedParts, observeCursor, observePrefix, type Cursor } from "./history/cursor"
+export type { Cursor } from "./history/cursor"
 
 export type TranscriptMessage = Readonly<{
   info: Message
@@ -31,7 +28,8 @@ const SKIPPED_PART_TYPES = new Set([
 
 /** A delivered card is appended to a reviewed message; it is not new work to review. */
 function reviewableParts(parts: readonly Part[]): Part[] {
-  return parts.filter((part) => part.type !== "tool" || !isAdvisorShell(part))
+  return parts.filter((part) => (part.type !== "tool" || !isAdvisorShell(part)) &&
+    !(part.type === "text" && part.synthetic && part.text.includes("<advisor severity=")))
 }
 
 export function sliceDelta(
@@ -39,19 +37,35 @@ export function sliceDelta(
   cursor: Cursor,
 ): { readonly delta: TranscriptMessage[]; readonly next: Cursor } {
   const sorted = [...messages].sort(
-    (left, right) => left.info.time.created - right.info.time.created,
+    (left, right) => left.info.time.created - right.info.time.created || left.info.id.localeCompare(right.info.id),
   )
   const latest = sorted.at(-1)
+  const observed = observeCursor(sorted, reviewableParts)
+  const prefix = observePrefix(sorted, reviewableParts)
   const next: Cursor = latest
-    ? { lastMessageID: latest.info.id, lastPartCount: reviewableParts(latest.parts).length }
+    ? { lastMessageID: latest.info.id, lastPartCount: reviewableParts(latest.parts).length, observed,
+      ...(prefix === undefined ? {} : { prefix }) }
     : cursor
 
   if (cursor.lastMessageID === undefined) return { delta: sorted, next }
-
-  const cursorIndex = sorted.findIndex(
-    ({ info }) => info.id === cursor.lastMessageID,
-  )
+  const cursorIndex = sorted.findIndex(({ info }) => info.id === cursor.lastMessageID)
   if (cursorIndex < 0) return { delta: sorted, next }
+  if (cursor.observed !== undefined) {
+    const prefixChanged = prefix !== undefined && (cursor.prefix === undefined ||
+      observePrefix(sorted, reviewableParts, cursor.prefix.before)?.digest !== cursor.prefix.digest)
+    const delta = sorted.flatMap((message, index) => {
+      const before = cursor.observed?.[message.info.id]
+      const after = observed[message.info.id]
+      if (after === undefined && before === undefined) {
+        const parts = reviewableParts(message.parts)
+        return (index > cursorIndex || prefixChanged) && parts.length > 0 ? [{ info: message.info, parts }] : []
+      }
+      const parts = changedParts({ ...message, parts: reviewableParts(message.parts) },
+        before, after ?? observeCursor([message], reviewableParts)[message.info.id])
+      return parts.length === 0 ? [] : [{ info: message.info, parts }]
+    })
+    return { delta, next }
+  }
 
   const cursorMessage = sorted[cursorIndex]
   if (cursorMessage === undefined) return { delta: [], next }

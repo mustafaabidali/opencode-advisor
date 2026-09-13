@@ -52,25 +52,39 @@ function matches(part: Part, note: Note, output: string, digest: string): boolea
 
 export function createNativeRenderer(client: PluginInput["client"]): NonNullable<DeliveryClient["renderNote"]> {
   let connection: Promise<OpencodeClient> | undefined
-  return async ({ note, directory, canRender }) => {
+  type Destination = NonNullable<Awaited<ReturnType<OpencodeClient["session"]["messages"]>>["data"]>
+  const batches = new WeakMap<object, Map<string, Promise<Destination>>>()
+  return async ({ note, directory, canRender, batch = {} }) => {
     const api = await (connection ??= connect(client, directory).catch((error: unknown) => {
       connection = undefined
       throw error
     }))
-    const response = await api.session.messages({ sessionID: note.root_session, directory })
-    if (!response.response.ok || response.error !== undefined || response.data === undefined) {
-      throw new Error("advisor could not inspect the card destination")
+    const scope = `${directory}\0${note.root_session}`
+    let destinations = batches.get(batch)
+    if (destinations === undefined) { destinations = new Map(); batches.set(batch, destinations) }
+    let loading = destinations.get(scope)
+    if (loading === undefined) {
+      loading = (async () => {
+        const response = await api.session.messages({ sessionID: note.root_session, directory })
+        if (!response.response.ok || response.error !== undefined || response.data === undefined) {
+          throw new Error("advisor could not inspect the card destination")
+        }
+        return response.data
+      })()
+      destinations.set(scope, loading)
     }
+    try {
+    const messages = await loading
     const output = renderCard(note)
     const digest = createHash("sha256").update(output).digest("hex")
     const partID = `prt_advisor_${note.id}`
-    for (const message of response.data) {
+    for (const message of messages) {
       const existing = message.parts.find((part) => part.id === partID)
       if (existing === undefined) continue
       if (!matches(existing, note, output, digest)) throw new Error("advisor card identity conflicts with existing content")
       return message.info.id
     }
-    const anchor = response.data.findLast(({ info }) =>
+    const anchor = messages.findLast(({ info }) =>
       info.role === "assistant" && info.time.completed !== undefined &&
       !info.agent?.startsWith("advisor-") && !info.mode?.startsWith("advisor-"),
     )
@@ -93,6 +107,11 @@ export function createNativeRenderer(client: PluginInput["client"]): NonNullable
       !matches(written.data, note, output, digest)) {
       throw new Error("advisor native card was not acknowledged")
     }
+    anchor.parts.push(written.data)
     return anchor.info.id
+    } catch (error) {
+      destinations.delete(scope)
+      throw error
+    }
   }
 }

@@ -17,18 +17,22 @@ The standing rule governs a card: verify current evidence and scope, honor user 
 - `ctrl+x ↓` enters the `advisor:<slug>` child session where the reviewer reasoned and used tools; `ctrl+x ←` / `→` moves between related sessions. Turn on OpenCode's `display_thinking` to see reviewer reasoning there.
 - `advisor notes --last N [--json]` prints persisted notes with reasoning and evidence.
 
-Use `advisor_checkpoint` at existing verification checkpoints and before claiming completion. Inspect the proposals together, then batch-record `open`, `resolved`, `dismissed`, or `deferred` dispositions with reasons. Resolution and reopening require checked evidence. A verified, relevant concern or blocker needs an in-scope fix or an explicit justified disposition; optional improvements can be deferred. This is not a per-note or per-tool-call ritual.
+Keep working while advisors run. Never wait, sleep, or poll for an advisor response, including before claiming completion. Use `advisor_checkpoint` at existing verification checkpoints to inspect proposals already available, then batch-record `open`, `resolved`, `dismissed`, or `deferred` dispositions with reasons. An empty inbox requires no repeated check; consider later notes when they arrive. Resolution and reopening require checked evidence. A verified, relevant concern or blocker already received needs an in-scope fix or an explicit justified disposition; optional improvements can be deferred. This is not a per-note or per-tool-call ritual.
 
 Each underlying issue can have several independent proposed remedies. Resolving the faster reviewer's proposal does not suppress a later different fix or new evidence. Compare merit and task benefit regardless of arrival time or model label. Closed proposals stay closed unless explicitly reopened with new evidence. Supply each finding's `reviewed_revision` and `version` when updating it; inspect again if either changed. Equivalent new reports preserve the version, but every disposition or verification update advances it.
 
 Use `task=continue` normally, `task=replace` for an explicit replacement objective, and `task=stop/resume` for the user's stop/resume instruction. A routine checkpoint never clears a stop. Verification uses observed worktree snapshots/tool changes, not a guarantee that external files are unchanged; inspect the actual code and output.
+
+Checkpoint schema v2 returns at most 20 proposals by default (50 maximum). Follow `page.next_offset`; global completion/action gates and unavailable counts include every page. Summary text is an excerpt. Use `detail: { finding_id, kind: "report", report_offset, text_offset }` for full report JSON chunks, or `kind: "finding"` for full provenance/disposition data. Read relevant complete details before recording verification. Chunks are at most 6,000 characters.
 
 Completed reviewers enter delivery independently; slower reviewers continue. Redundant reports retain provenance and share the finding's delivery status; a genuine reopening with checked evidence makes subsequent reports eligible for injection and cards again. Checkpoints list missing or corrupt reports under `unavailable_reports`, alongside readable proposals. Restore unavailable reports or record a justified disposition after checking the issue before claiming completion.
 
 ## Read state
 
 - `/advisor` runs `advisor status` and then `advisor notes --last 5`, verbatim.
-- `advisor status [--json]`: models, fallbacks, tools, cooldowns (`cooled_until`), pass and note counts, cost, watched sessions.
+- `advisor status [--json]`: models, fallbacks, tools, cooldowns, per-instance pass/note counts, durable usage and coverage, execution state, build fingerprint/instance, watched sessions.
+- `advisor index [--all]`: resumable legacy metadata/receipt migration; listing warns until coverage is complete.
+- `advisor repair-receipts`: restore canonical SQLite delivery markers to JSON before rollback, with every writer stopped.
 - `~/.local/share/opencode-advisor/advisor.log`: startup warnings, every pass with its outcome, fallback, and card delivery.
 
 Pass outcomes, as they appear in status, transcripts, and the log:
@@ -40,6 +44,13 @@ Pass outcomes, as they appear in status, transcripts, and the log:
 | `fallback` | The primary model failed and the one retry model produced the note; the card ends in ` · fallback`. |
 | `no_model` | Primary and fallback are both unavailable or cooled; the pass was skipped. |
 | `error`, `timeout`, `quarantined` | Provider error, `pass_timeout_ms` exceeded, or a note matched `quarantine_patterns` and was withheld. |
+| `context_budget_exceeded` | Required findings/evidence cannot safely fit the rollover carry. Inspect findings or increase the configured carry budget. |
+
+Each reviewer progresses independently. Optional provider admission defaults to unlimited (`0`) and coordinates the same process/data directory/limit configuration, not every application or machine. Throttle/retry events and empty content-filtered responses can use the configured fallback when time remains. An unconfirmed remote cancellation cannot start another overlapping request. `recover: true` on a checkpoint requests a background recheck after automatic backoff reaches `recovery_required`; the checkpoint returns without waiting for recovery. Never poll it while waiting for a reviewer. Repeated timeouts back off only the affected reviewer.
+
+Cursors and unfinished pass identities persist. A live local process keeps exclusive ownership of its reviewer lane; `owned_elsewhere` is not permission to abort it. After release or confirmed owner exit, reconcile pending work before retrying. Restarts and context rollover prime a fresh child from open findings and compact closed dispositions; unknown model capacity is disclosed, and required open evidence is never silently discarded. Stop remains in effect across restart, while resume releases retained findings for normal delivery checks.
+
+Usage coverage can be partial or unknown. Counts include observed intermediate, fallback, failure, and compaction messages; cost is still an upstream estimate. Legacy transcript totals are excluded. Restart all OpenCode instances when updating the plugin so every writer understands authoritative SQLite receipts. Before rollback, stop all writers and repair JSON receipt mirrors using the new CLI.
 
 ## Change who reviews
 
@@ -109,13 +120,16 @@ Where things live:
 - `src/models.ts`: model references, variants and effort, failure classification, cooldowns.
 - `src/delta.ts`: redacted transcript deltas that exclude advisor delivery.
 - `src/advice.ts`: `<advice>` parsing, severity floor, quarantine.
-- `src/notes/store.ts`, `src/notes/delivery.ts`: notes, pending pointers, transcripts, delivery state, status snapshots.
+- `src/notes/store.ts`, `src/notes/catalog.ts`: notes, pending pointers, transcripts, indexed delivery receipts, status snapshots.
+- `src/usage/*`, `src/advisor/journal.ts`: per-message accounting and restart progress in the shared SQLite worker.
+- `src/history/*`, `src/log/*`: bounded history projections, batched logs, and rotation.
 - `src/prompts.ts`: reviewer contract, pass prompt, standing rule, blocker injection.
 - `src/config.ts`: `DEFAULTS`, JSONC precedence, environment overrides, data directory.
 - `bin/advisor.ts`: `status`, `notes`, `--note <id>`, pending-card output, `--version`.
 
 Invariants:
 
+- The primary never waits for reviewer execution or recovery, even before completion. Checkpoints inspect arrived findings.
 - Cards are delivered only at idle on a watched session; real user turns pause the remaining batch. Native delivery never creates a user message or prompts the primary.
 - `session.prompt` targets advisor child sessions only.
 - Delivery-agent messages and native advisor output are excluded from deltas and pass triggers.

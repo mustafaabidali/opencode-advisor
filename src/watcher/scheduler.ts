@@ -23,7 +23,9 @@ export type PassSchedulerOptions<Timer> = Readonly<{
   log: Logger
   clock: () => number
   timers: TimerApi<Timer>
-  onPass: (sessionID: string, reason: PassReason) => Promise<void>
+  onPass: (sessionID: string, reason: PassReason) => Promise<void | boolean>
+  respectIdleCooldown?: boolean
+  dispatchOnly?: boolean
 }>
 
 export class PassScheduler<Timer> {
@@ -43,7 +45,8 @@ export class PassScheduler<Timer> {
       this.logTrigger(sessionID, reason, "dirty")
       return
     }
-    if (reason === "idle") {
+    const cooldownRemaining = state.lastPassEnd + this.options.config.cooldown_ms - this.options.clock()
+    if (reason === "idle" && (!this.options.respectIdleCooldown || cooldownRemaining <= 0)) {
       this.clearTimer(state)
       this.logTrigger(sessionID, reason, "scheduled")
       void this.run(sessionID, "idle")
@@ -53,13 +56,12 @@ export class PassScheduler<Timer> {
       this.logTrigger(sessionID, reason, "debounced")
       return
     }
-    const cooldownRemaining = state.lastPassEnd + this.options.config.cooldown_ms - this.options.clock()
     this.logTrigger(
       sessionID,
       reason,
       cooldownRemaining > this.options.config.pass_debounce_ms ? "cooldown" : "scheduled",
     )
-    this.queueStep(sessionID, state, true)
+    this.queueStep(sessionID, state, reason !== "idle")
   }
 
   suppress(sessionID: string, ms: number): void {
@@ -74,6 +76,10 @@ export class PassScheduler<Timer> {
       this.clearTimer(state)
     }
     this.states.delete(sessionID)
+  }
+  pending(sessionID: string): boolean {
+    const state = this.states.get(sessionID)
+    return state !== undefined && (state.inFlight || state.dirty || state.timer !== undefined)
   }
 
   private state(sessionID: string): SchedulerState<Timer> {
@@ -129,28 +135,29 @@ export class PassScheduler<Timer> {
     state.inFlight = true
     const startedAt = this.options.clock()
     let ok = true
-    void this.options.log.info({ msg: "advisor pass start", sessionID, reason })
+    let worked: boolean | void = true
+    void this.options.log.info({ msg: this.options.dispatchOnly ? "advisor notification start" : "advisor pass start", sessionID, reason })
     try {
-      await this.options.onPass(sessionID, reason)
+      worked = await this.options.onPass(sessionID, reason)
     } catch (error) {
       ok = false
       await this.options.log.error({ msg: "watcher.pass.failed", sessionID, reason, error })
     } finally {
       state.inFlight = false
-      state.lastPassEnd = this.options.clock()
+      if (worked !== false) state.lastPassEnd = this.options.clock()
       void this.options.log.info({
-        msg: "advisor pass end",
+        msg: this.options.dispatchOnly ? "advisor notification end" : "advisor pass end",
         sessionID,
         reason,
-        durationMs: state.lastPassEnd - startedAt,
+        durationMs: this.options.clock() - startedAt,
         ok,
       })
     }
-    if (!state.dirty) return
+    if (!state.dirty || this.states.get(sessionID) !== state) return
     const followUpReason = state.dirtyReason
     state.dirty = false
     state.dirtyReason = "step"
-    if (followUpReason === "idle") {
+    if (followUpReason === "idle" && !this.options.respectIdleCooldown) {
       void this.run(sessionID, "idle")
       return
     }

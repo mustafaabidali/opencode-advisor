@@ -165,6 +165,7 @@ function makeHarness(
     beforeShell?: (index: number) => Promise<void>
     nativeRender?: (input: Readonly<{ note: Note; canRender: () => boolean }>) => Promise<string | undefined>
     markDeliveredThrows?: boolean
+    beforeRemovePending?: () => Promise<void>
   }> = {},
 ): Harness {
   const calls: string[] = []
@@ -195,6 +196,7 @@ function makeHarness(
     },
     removePending: async (_cwd, ids) => {
       calls.push("removed")
+      await options.beforeRemovePending?.()
       for (const id of ids) pending.delete(id)
     },
   } satisfies DelivererOptions["store"]
@@ -694,6 +696,33 @@ describe("Deliverer cards and notifications", () => {
       message: "Advisor card delivery failed - see advisor notes",
       variant: "warning",
     })
+  })
+
+  test("a different proposal appended during third-failure cleanup remains deliverable", async () => {
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    const harness = makeHarness({
+      shellStatuses: [500, 500, 500],
+      beforeRemovePending: async () => {
+        entered.resolve()
+        await release.promise
+      },
+    })
+    await harness.deliverer.deliver("root-1", [note("failed-proposal")])
+    await status(harness.deliverer, "idle")
+    await status(harness.deliverer, "idle")
+    const cleanup = status(harness.deliverer, "idle")
+    await entered.promise
+    await harness.deliverer.deliver("root-1", [note("better-proposal")])
+    release.resolve()
+    await cleanup
+    await status(harness.deliverer, "idle")
+    expect(harness.shellCalls.map((call) => call.body.command)).toEqual([
+      "advisor --note failed-proposal",
+      "advisor --note failed-proposal",
+      "advisor --note failed-proposal",
+      "advisor --note better-proposal",
+    ])
   })
 
   test("a rejected toast never prevents idle card delivery", async () => {

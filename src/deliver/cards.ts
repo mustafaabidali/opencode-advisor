@@ -86,10 +86,14 @@ export class Deliverer {
   }
 
   onUserMessage(info: UserMessage): void {
-    this.#turns.user(info)
+    if (this.#options.isWatched(info.sessionID)) this.#turns.user(info)
   }
 
   async onEvent(event: Event): Promise<void> {
+    if (event.type === "session.deleted") { this.forget(event.properties.info.id); return }
+    const id = event.type === "message.updated" ? event.properties.info.sessionID :
+      event.type === "session.status" || event.type === "session.compacted" ? event.properties.sessionID : undefined
+    if (id === undefined || !this.#options.isWatched(id)) return
     this.#turns.event(event)
     switch (event.type) {
       case "session.status":
@@ -115,8 +119,14 @@ export class Deliverer {
   }
 
   markCompacting(sessionID: string): void {
-    this.#transformer.compacting.add(sessionID)
+    if (this.#options.isWatched(sessionID)) this.#transformer.compacting.add(sessionID)
   }
+  forget(sessionID: string): void {
+    this.#queue.forget(sessionID)
+    this.#turns.forget(sessionID)
+    this.#transformer.clearSession(sessionID)
+  }
+  get metrics() { return { turns: this.#turns.size, queued_roots: this.#queue.size, injected_roots: this.pendingBlockers.size } }
 
   clearCompacting(sessionID: string): void {
     this.#transformer.compacting.delete(sessionID)

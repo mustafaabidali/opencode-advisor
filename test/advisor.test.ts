@@ -10,8 +10,17 @@ import {
 import { DEFAULTS, type AdvisorConfig } from "../src/config"
 import type { Logger } from "../src/log"
 import { CooldownRegistry } from "../src/models"
-import { renderCard, type Note, type NoteInput, type StateSnapshot, type TranscriptRecord } from "../src/notes"
+import { renderCard, type Finding, type Note, type NoteInput, type StateSnapshot, type TranscriptRecord } from "../src/notes"
 import { resolveEntry, type AdvisorEntry } from "../src/roster"
+import { ReviewJournal } from "../src/advisor/journal"
+import { FindingStore } from "../src/notes/findings"
+import { UsageLedger } from "../src/usage/ledger"
+import { executeAdvisorPass, type PassResult } from "../src/advisor/pass"
+import { carryFindings } from "../src/advisor/carry"
+import { mkdtemp, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { Watcher } from "../src/watcher"
 
 const DIRECTORY = "/workspace/project"
 const PRIMARY = "amazon-bedrock/openai.gpt-5.6-sol"
@@ -25,6 +34,7 @@ function config(overrides: Partial<AdvisorConfig> = {}): AdvisorConfig {
     default_model: DEFAULT_MODEL,
     default_fallback: `${FALLBACK}:xhigh`,
     pass_timeout_ms: 100,
+    min_fallback_budget_ms: 1,
     ...overrides,
   }
 }
@@ -125,6 +135,9 @@ class MemoryStore implements AdvisorStore {
     this.notes.push(note)
     return note
   }
+  async recoverNote(input: NoteInput): Promise<Note | undefined> {
+    return this.notes.find((note) => input.idempotency_key !== undefined && note.idempotency_key === input.idempotency_key)
+  }
 
   async appendTranscript(_root: string, record: TranscriptRecord): Promise<void> {
     this.transcripts.push(record)
@@ -132,6 +145,18 @@ class MemoryStore implements AdvisorStore {
 
   async writeState(_cwd: string, snapshot: StateSnapshot): Promise<void> {
     this.states.push(snapshot)
+  }
+  async listFindings(cwd: string, root_session?: string): Promise<Finding[]> {
+    return this.notes.filter((note) => note.cwd === cwd && note.root_session === root_session).map((note) => ({
+      id: note.finding_id ?? `finding-${note.id}`, issue_id: note.issue_id ?? `issue-${note.id}`,
+      cwd, root_session: note.root_session, task_id: note.review?.task_id ?? note.root_session,
+      reviewed_revision: note.review?.revision ?? "unversioned", state: "open", version: 0, updated_at: note.time,
+      provenance: [{ note_id: note.id, advisor_slug: note.advisor_slug, model: note.model, time: note.time,
+        reviewed_revision: note.review?.revision ?? "unversioned" }],
+    }))
+  }
+  async readNotes(cwd: string, root: string, ids: readonly string[]): Promise<Note[]> {
+    return this.notes.filter((note) => note.cwd === cwd && note.root_session === root && ids.includes(note.id))
   }
 }
 
@@ -165,15 +190,19 @@ class FakeClient implements AdvisorClient {
   readonly aborts: Parameters<AdvisorClient["session"]["abort"]>[0][] = []
   messages: Array<{ info: UserMessage | AssistantMessage; parts: Part[] }> = [userMessage("user-1", "Build the feature")]
   promptScripts: Array<(call: PromptCall) => Promise<ReturnTypeData>> = []
+  abortScript?: () => Promise<Awaited<ReturnType<AdvisorClient["session"]["abort"]>>>
+  messagesScript?: (call: Parameters<AdvisorClient["session"]["messages"]>[0]) => Promise<Awaited<ReturnType<AdvisorClient["session"]["messages"]>>>
+  createScript?: () => Promise<Awaited<ReturnType<AdvisorClient["session"]["create"]>>>
   createCount = 0
 
   readonly session: AdvisorClient["session"] = {
     create: async (call) => {
       this.creates.push(call)
       this.createCount += 1
+      if (this.createScript !== undefined) return this.createScript()
       return { data: { id: `advisor-session-${this.createCount}` }, response: { status: 200 } }
     },
-    messages: async () => ({ data: this.messages, response: { status: 200 } }),
+    messages: async (call) => this.messagesScript?.(call) ?? ({ data: this.messages, response: { status: 200 } }),
     prompt: async (call) => {
       this.prompts.push(call)
       const script = this.promptScripts.shift()
@@ -183,6 +212,7 @@ class FakeClient implements AdvisorClient {
     },
     abort: async (call) => {
       this.aborts.push(call)
+      if (this.abortScript !== undefined) return this.abortScript()
       return { data: true, response: { status: 200 } }
     },
   }
@@ -191,7 +221,7 @@ class FakeClient implements AdvisorClient {
 type ReturnTypeData = Awaited<ReturnType<AdvisorClient["session"]["prompt"]>>
 
 async function until(predicate: () => boolean): Promise<void> {
-  for (let attempt = 0; attempt < 50; attempt += 1) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
     if (predicate()) return
     await Promise.resolve()
   }
@@ -213,13 +243,17 @@ function runtime(options: Readonly<{
   timers?: AdvisorTimers
   clock?: () => number
   warnings?: string[]
+  onWarning?: (slug: string, message: string) => Promise<void>
+  onResult?: (root: string, result: PassResult) => void | Promise<void>
   logger?: Logger
+  config?: Partial<AdvisorConfig>
+  journal?: ReviewJournal
 }> = {}): { runtime: AdvisorRuntime; client: FakeClient; store: MemoryStore } {
   const client = options.client ?? new FakeClient()
   const store = options.store ?? new MemoryStore()
   return {
     runtime: new AdvisorRuntime({
-      config: config(),
+      config: config(options.config),
       roster: options.roster ?? [entry("Reviewer")],
       catalog: new Map([[PRIMARY, "GPT-5.6 Sol"], [FALLBACK, "Claude Fable"]]),
       cooldowns: options.cooldowns ?? new CooldownRegistry(options.clock),
@@ -229,10 +263,14 @@ function runtime(options: Readonly<{
       directory: DIRECTORY,
       clock: options.clock ?? (() => 1_000),
       timers: options.timers ?? new FakeTimers(),
+      ...(options.journal === undefined ? {} : { journal: options.journal }),
+      ...(options.onResult === undefined ? {} : { onResult: options.onResult }),
       readFile: async () => "project guidance",
       onAdvisorSession: () => {},
       onWarning: (slug, message) => {
+        if (options.onWarning !== undefined) return options.onWarning(slug, message)
         options.warnings?.push(`${slug}:${message}`)
+        return undefined
       },
     }),
     client,
@@ -241,6 +279,640 @@ function runtime(options: Readonly<{
 }
 
 describe("AdvisorRuntime", () => {
+  test("a local journal failure is not sent, does not cool models, and does not consume fallback", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "advisor-local-failure-"))
+    const usage = new UsageLedger({ dataDir, directory: DIRECTORY, clock: () => 1000 })
+    const database = new FindingStore(dataDir)
+    const client = new FakeClient()
+    const cooldowns = new CooldownRegistry(() => 1000)
+    try {
+      const result = await executeAdvisorPass({
+        config: config(), entry: entry("Reviewer"), catalog: new Map(), cooldowns,
+        store: new MemoryStore(), log, client: client.session, directory: DIRECTORY,
+        watchedID: "root", advisorSession: "child", prompt: () => "review",
+        clock: () => 1000, timers: new FakeTimers(), refreshSession: async () => "replacement",
+        onWarning: () => {}, usage, passID: "local-failure",
+        beforeDispatch: async () => { throw new Error("Advisor journal ownership changed") },
+      })
+      expect(result).toMatchObject({ outcome: "error", cancellation: "not_sent" })
+      expect(client.prompts).toHaveLength(0)
+      expect(cooldowns.isCooled(PRIMARY)).toBe(false)
+      expect(cooldowns.isCooled(FALLBACK)).toBe(false)
+      expect(await database.usageForPass("local-failure")).toMatchObject([{ state: "not_sent", coverage: "complete" }])
+    } finally {
+      await usage.close()
+      await database.close()
+      await rm(dataDir, { recursive: true, force: true })
+    }
+  })
+
+  test("reconciling our own aborted request does not treat the primary model as faulty", async () => {
+    const timers = new FakeTimers()
+    const client = new FakeClient()
+    const cooldowns = new CooldownRegistry(() => 1000)
+    client.abortScript = async () => ({ error: "unconfirmed" })
+    client.promptScripts.push(() => new Promise(() => {}))
+    const subject = runtime({ timers, client, cooldowns })
+    try {
+      const pass = subject.runtime.runPass("root", "idle")
+      await until(() => client.prompts.length === 1)
+      timers.fireAll()
+      const pending = (await pass)[0]
+      client.messagesScript = async () => ({ data: [assistant("", {
+        sessionID: "advisor-session-1", time: { created: 1001, completed: 1002 },
+        error: { name: "MessageAbortedError", data: { message: "Aborted" } },
+      })] })
+      expect(await pending?.reconcile?.()).toMatchObject({ outcome: "timeout", cancellation: "cancelled_confirmed" })
+      expect(cooldowns.isCooled(PRIMARY)).toBe(false)
+      expect(client.prompts).toHaveLength(1)
+    } finally { await subject.runtime.dispose() }
+  })
+
+  test("confirmed timeouts back off per reviewer instead of immediately repeating paid work", async () => {
+    let now = 1000
+    const timers = new FakeTimers()
+    const client = new FakeClient()
+    client.promptScripts.push(() => new Promise(() => {}), () => new Promise(() => {}))
+    const subject = runtime({ client, timers, clock: () => now, config: { cooldown_ms: 1000 } })
+    try {
+      const first = subject.runtime.runPass("root", "idle")
+      await until(() => client.prompts.length === 1)
+      timers.fireAll()
+      expect((await first)[0]?.cancellation).toBe("cancelled_confirmed")
+      const immediate = subject.runtime.runPass("root", "idle")
+      for (let i = 0; i < 200; i++) await Promise.resolve()
+      expect(client.prompts).toHaveLength(1)
+      expect(await immediate).toEqual([])
+      now += 1001
+      const second = subject.runtime.runPass("root", "idle")
+      await until(() => client.prompts.length === 2)
+      timers.fireAll()
+      await second
+      now += 1001
+      expect(await subject.runtime.runPass("root", "idle")).toEqual([])
+      expect(client.prompts).toHaveLength(2)
+      now += 1000
+      await subject.runtime.runPass("root", "idle")
+      expect(client.prompts).toHaveLength(3)
+    } finally { await subject.runtime.dispose() }
+  })
+
+  test("a stalled recovery warning cannot keep an explicit recovery request waiting forever", async () => {
+    const timers = new FakeTimers()
+    const client = new FakeClient()
+    client.abortScript = async () => ({ error: "unconfirmed" })
+    client.promptScripts.push(() => new Promise(() => {}))
+    let warning = false
+    const subject = runtime({ timers, client, onWarning: async () => {
+      warning = true
+      await new Promise(() => {})
+    } })
+    try {
+      const pass = subject.runtime.runPass("root", "idle")
+      await until(() => client.prompts.length === 1)
+      timers.fireAll()
+      await pass
+      await subject.runtime.recover("root")
+      await subject.runtime.recover("root")
+      let settled = false
+      const recovery = subject.runtime.recover("root").then(() => { settled = true })
+      await until(() => warning)
+      timers.fireAll()
+      for (let i = 0; i < 200; i++) await Promise.resolve()
+      expect(settled).toBe(true)
+      await recovery
+      expect(subject.client.prompts).toHaveLength(1)
+    } finally { await subject.runtime.dispose() }
+  })
+
+  test("a failed report write can recover after absence is verified without replaying the provider", async () => {
+    const store = new MemoryStore()
+    const write = store.writeNote.bind(store)
+    let failing = true
+    store.writeNote = async (input) => {
+      if (failing) throw new Error("temporary disk failure")
+      return write(input)
+    }
+    const client = new FakeClient()
+    client.promptScripts.push(async () => ({ data: assistant(
+      '<advice severity="concern">reasoning: checked\nnote: Preserve this returned fix\nevidence: recovery.ts:1</advice>') }))
+    const subject = runtime({ store, client })
+    const delivered: Note[] = []
+    const result = await subject.runtime.runPass("root", "idle", { onResult: (result) => { delivered.push(...result.notes) } })
+    expect(result[0]?.persistence).toBe("recovery_required")
+    failing = false
+    await subject.runtime.recover("root")
+    expect(store.notes).toHaveLength(1)
+    expect(delivered).toHaveLength(1)
+    expect(client.prompts).toHaveLength(1)
+    await subject.runtime.dispose()
+  })
+
+  test("a late content-filtered completion clears uncertainty without advancing the cursor and selects fallback next", async () => {
+    const late = Promise.withResolvers<ReturnTypeData>()
+    const timers = new FakeTimers()
+    const client = new FakeClient()
+    client.abortScript = async () => ({ error: "unconfirmed" })
+    client.promptScripts.push(() => late.promise)
+    const subject = runtime({ client, timers })
+    const work = subject.runtime.runPass("root", "idle")
+    await until(() => client.prompts.length === 1)
+    timers.fireAll()
+    const timedOut = (await work)[0]
+    expect(timedOut?.cancellation).toBe("cancellation_uncertain")
+    late.resolve({ data: assistant("", { finish: "content-filter" }) })
+    expect((await timedOut?.pending)?.outcome).toBe("error")
+    await subject.runtime.runPass("root", "idle")
+    expect(client.prompts[1]?.body.agent).toBe("advisor-reviewer-fb")
+    await subject.runtime.dispose()
+  })
+
+  test("a stalled no-model transcript cannot bypass the execution deadline", async () => {
+    const timers = new FakeTimers()
+    const cooldowns = new CooldownRegistry(() => 1000)
+    cooldowns.markCooled(PRIMARY, 5000)
+    cooldowns.markCooled(FALLBACK, 5000)
+    const store = new MemoryStore()
+    let writing = false
+    store.appendTranscript = async () => { writing = true; await new Promise(() => {}) }
+    const subject = runtime({ store, cooldowns, timers })
+    let settled = false
+    const work = subject.runtime.runPass("root", "idle").then((result) => { settled = true; return result })
+    await until(() => writing)
+    timers.fireAll()
+    for (let i = 0; i < 200; i++) await Promise.resolve()
+    expect(settled).toBe(true)
+    expect((await work)[0]?.outcome).toBe("timeout")
+    await subject.runtime.dispose()
+  })
+
+  test("evicting and disposing watched roots releases their runtime lanes and contexts", async () => {
+    const subject = runtime({ roster: [resolved({ name: "Gated", when: { edits: ["**/*.md"], commands: [], tools: [] } })] })
+    const watcher = new Watcher({
+      config: config(), clock: () => 1000, timers: new FakeTimers(), log,
+      client: { session: { get: async () => ({}) } }, onPass: async () => {},
+      isPinned: (root) => subject.runtime.isPinned(root), onForget: (root) => subject.runtime.forget(root),
+    })
+    for (let i = 0; i < 230; i++) {
+      const id = `root-${i}`
+      await watcher.handleEvent({ type: "session.created", properties: { info: {
+        id, title: id, projectID: "fixture", directory: DIRECTORY, version: "1", time: { created: i, updated: i },
+      } } })
+      await subject.runtime.runPass(id, "idle")
+    }
+    expect(subject.runtime.metrics).toMatchObject({ roots: 200, lanes: 200, active: 0, deliveries: 0 })
+    watcher.dispose()
+    await subject.runtime.dispose()
+    expect(subject.runtime.metrics).toMatchObject({ roots: 0, lanes: 0, active: 0, deliveries: 0 })
+    expect(subject.client.prompts).toHaveLength(0)
+  })
+
+  test("an interrupted request is recovered from its child after restart without dispatching it again", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "advisor-interrupted-"))
+    const journal = new ReviewJournal(dataDir, DIRECTORY)
+    const sent = Promise.withResolvers<void>()
+    const first = runtime({ journal })
+    first.client.promptScripts.push(() => { sent.resolve(); return new Promise(() => {}) })
+    const work = first.runtime.runPass("root", "idle")
+    await sent.promise
+    await first.runtime.dispose()
+    await work
+    const report = assistant('<advice severity="concern">reasoning: recovered evidence\nnote: Keep the later remedy\nevidence: changed.ts:2</advice>',
+      { sessionID: "advisor-session-1", time: { created: 1001, completed: 1002 }, finish: "stop" })
+    first.client.messagesScript = async (call) => ({ data: call.path.id === "root" ? first.client.messages : [report] })
+    const resumed = runtime({ journal, client: first.client, store: first.store })
+    const delivered: Note[] = []
+    try {
+      await resumed.runtime.runPass("root", "idle", { onResult: (result) => { delivered.push(...result.notes) } })
+      expect(first.client.prompts).toHaveLength(1)
+      await resumed.runtime.recover("root")
+      await resumed.runtime.recover("root")
+      await resumed.runtime.runPass("root", "idle")
+      expect(delivered.map((note) => note.note)).toEqual(["Keep the later remedy"])
+      expect(first.client.prompts).toHaveLength(1)
+      expect(first.store.notes).toHaveLength(1)
+    } finally {
+      await resumed.runtime.dispose()
+      await journal.close()
+      await rm(dataDir, { recursive: true, force: true })
+    }
+  })
+
+  test("a stored user stop is respected before any request or recovery after restart", async () => {
+    class StoppedStore extends MemoryStore {
+      async readTask() { return { task_id: "user-1", revision: "r1", stopped: true } }
+    }
+    const subject = runtime({ store: new StoppedStore() })
+    await subject.runtime.runPass("root", "idle")
+    expect(subject.client.creates).toHaveLength(0)
+    expect(subject.client.prompts).toHaveLength(0)
+    await subject.runtime.dispose()
+  })
+
+  test("a damaged reviewer journal pauses visibly while another reviewer can still run", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "advisor-damaged-journal-"))
+    const journal = new ReviewJournal(dataDir, DIRECTORY)
+    const database = new FindingStore(dataDir)
+    const key = { cwd: DIRECTORY, root_session: "root", advisor_slug: "reviewer" }
+    const subject = runtime({ journal, roster: [entry("Reviewer"), entry("Healthy")] })
+    try {
+      expect(await database.claimJournal(key, "fixture", process.pid, null)).toBe(true)
+      await database.saveJournal(key, "fixture", '{"cursor": "corrupt"}')
+      await database.releaseJournal(key, "fixture")
+      const first: unknown = await subject.runtime.runPass("root", "idle").catch((error: unknown) => error)
+      expect(first).toMatchObject([{ slug: "healthy", outcome: "silent" }])
+      await subject.runtime.recover("root")
+      expect(await subject.runtime.runPass("root", "idle")).toEqual([])
+      expect(subject.client.prompts).toHaveLength(1)
+      expect(subject.store.states.at(-1)?.execution).toContainEqual(expect.objectContaining({
+        advisor_slug: "reviewer", state: "recovery_required",
+      }))
+    } finally {
+      await subject.runtime.dispose()
+      await journal.close()
+      await database.close()
+      await rm(dataDir, { recursive: true, force: true })
+    }
+  })
+
+  test("a durable cursor survives restart, while another live instance cannot claim the same reviewer", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "advisor-restart-"))
+    const journal = new ReviewJournal(dataDir, DIRECTORY)
+    const otherJournal = new ReviewJournal(dataDir, DIRECTORY)
+    const first = runtime({ journal })
+    const second = runtime({ journal: otherJournal, client: first.client, store: first.store })
+    try {
+      await first.runtime.runPass("root", "idle")
+      await second.runtime.runPass("root", "idle")
+      expect(first.client.prompts).toHaveLength(1)
+      await first.runtime.dispose()
+      await second.runtime.dispose()
+      const resumed = runtime({ journal: otherJournal, client: first.client, store: first.store })
+      try {
+        await resumed.runtime.runPass("root", "idle")
+        expect(first.client.prompts).toHaveLength(1)
+        first.client.messages.push(userMessage("user-2", "Continue", 10))
+        await resumed.runtime.runPass("root", "idle")
+        expect(first.client.prompts).toHaveLength(2)
+        expect(first.client.creates).toHaveLength(2)
+      } finally { await resumed.runtime.dispose() }
+    } finally {
+      await first.runtime.dispose()
+      await second.runtime.dispose()
+      await journal.close()
+      await otherJournal.close()
+      await rm(dataDir, { recursive: true, force: true })
+    }
+  })
+
+  test("forgotten lanes finish releasing ownership before their journal store closes", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "advisor-release-"))
+    const journal = new ReviewJournal(dataDir, DIRECTORY)
+    const database = new FindingStore(dataDir)
+    const release = Promise.withResolvers<void>()
+    const entered = Promise.withResolvers<void>()
+    const create = journal.lane.bind(journal)
+    journal.lane = (...args) => {
+      const lane = create(...args)
+      const close = lane.close.bind(lane)
+      lane.close = async () => { entered.resolve(); await release.promise; await close() }
+      return lane
+    }
+    const timers = new FakeTimers()
+    const subject = runtime({ journal, timers })
+    let disposed: Promise<void> | undefined
+    let closed: Promise<void> | undefined
+    try {
+      await subject.runtime.runPass("root", "idle")
+      subject.runtime.forget("root")
+      await entered.promise
+      let disposalDone = false
+      disposed = subject.runtime.dispose().then(() => { disposalDone = true })
+      for (let i = 0; i < 200; i++) await Promise.resolve()
+      expect(disposalDone).toBe(true)
+      await disposed
+      let journalDone = false
+      closed = journal.close().then(() => { journalDone = true })
+      for (let i = 0; i < 200; i++) await Promise.resolve()
+      expect(journalDone).toBe(false)
+      release.resolve()
+      await closed
+      expect(await database.readJournal({ cwd: DIRECTORY, root_session: "root", advisor_slug: "reviewer" }))
+        .toMatchObject({ owner: null, pid: null })
+    } finally {
+      release.resolve()
+      await disposed
+      await subject.runtime.dispose()
+      await closed
+      await journal.close()
+      await database.close()
+      await rm(dataDir, { recursive: true, force: true })
+    }
+  })
+
+  test("stop preserves a late finding and resume delivers it without reviewing the same delta again", async () => {
+    const client = new FakeClient()
+    const late = Promise.withResolvers<ReturnTypeData>()
+    client.promptScripts.push(() => late.promise)
+    client.abortScript = async () => {
+      late.resolve({ data: assistant("", { error: { name: "MessageAbortedError", data: { message: "Aborted" } } }) })
+      return { data: true }
+    }
+    const { runtime: subject, store } = runtime({ client })
+    const delivered: Note[] = []
+    const work = subject.runPass("root", "idle", { onResult: (result) => { delivered.push(...result.notes) } })
+    await until(() => client.prompts.length === 1)
+    subject.pause("root")
+    for (let i = 0; i < 200; i++) await Promise.resolve()
+    expect(client.aborts).toHaveLength(0)
+    late.resolve({ data: assistant('<advice severity="concern">reasoning: checked\nnote: Preserve this fix\nevidence: test.ts:1</advice>') })
+    await work
+    await until(() => store.notes.length === 1)
+    await subject.runPass("root", "idle")
+    expect(delivered).toHaveLength(0)
+    expect(client.prompts).toHaveLength(1)
+    await subject.resume("root")
+    await until(() => delivered.length === 1)
+    expect(delivered[0]?.note).toBe("Preserve this fix")
+    await subject.dispose()
+  })
+
+  test("resume schedules every reviewer after the last notification targeted one reviewer", async () => {
+    const timers = new FakeTimers()
+    const subject = runtime({ timers, roster: [entry("First"), entry("Second")] })
+    try {
+      await subject.runtime.runPass("root", "idle", { advisorSlug: "second" })
+      subject.client.messages.push(userMessage("user-2", "Continue", 10))
+      subject.runtime.pause("root")
+      await subject.runtime.resume("root")
+      for (let i = 0; i < 300; i++) await Promise.resolve()
+      expect(subject.client.prompts.map((call) => call.body.agent).sort()).toEqual([
+        "advisor-first", "advisor-second", "advisor-second",
+      ])
+    } finally { await subject.runtime.dispose() }
+  })
+
+  test("resume can deliver retained findings before the new runtime receives a watcher callback", async () => {
+    const first = runtime()
+    first.client.promptScripts.push(async () => ({ data: assistant(
+      '<advice severity="concern">reasoning: checked\nnote: Resume this fix\nevidence: test.ts:1</advice>') }))
+    await first.runtime.runPass("root", "idle")
+    await first.runtime.dispose()
+    const delivered: Note[] = []
+    const resumed = runtime({ store: first.store, onResult: (root, result) => {
+      expect(root).toBe("root")
+      delivered.push(...result.notes)
+    } })
+    try {
+      await resumed.runtime.resume("root")
+      expect(delivered.map((note) => note.note)).toEqual(["Resume this fix"])
+    } finally { await resumed.runtime.dispose() }
+  })
+
+  test("forgetting a root while recovery is awaited cannot recreate its lane", async () => {
+    const { runtime: subject, client } = runtime()
+    const work = subject.runPass("root", "idle")
+    subject.forget("root")
+    await work
+    expect(subject.metrics).toMatchObject({ lanes: 0, roots: 0, active: 0 })
+    expect(client.prompts).toHaveLength(0)
+    await subject.dispose()
+  })
+
+  test("an uncertain upstream throttle blocks overlap and uses fallback after confirmed recovery", async () => {
+    let now = 1000
+    const client = new FakeClient()
+    client.abortScript = async () => ({ error: "not confirmed" })
+    client.promptScripts.push(() => new Promise(() => {}))
+    const { runtime: subject } = runtime({ client, clock: () => now, config: { cooldown_ms: 1000 } })
+    const work = subject.runPass("root", "idle")
+    await until(() => client.prompts.length === 1)
+    subject.observe({ type: "session.status", properties: { sessionID: "advisor-session-1",
+      status: { type: "retry", attempt: 1, message: "429 TooManyRequests", next: 2000 } } })
+    expect((await work)[0]?.cancellation).toBe("cancellation_uncertain")
+    await subject.runPass("root", "idle")
+    expect(client.prompts).toHaveLength(1)
+    now += 1001
+    client.abortScript = async () => ({ data: true })
+    await subject.runPass("root", "idle")
+    expect(client.prompts[1]?.body.agent).toBe("advisor-reviewer-fb")
+    await subject.dispose()
+  })
+  test("a context rollover carries the reviewer's independent findings into a new child between passes", async () => {
+    const client = new FakeClient()
+    client.promptScripts.push(async () => ({ data: assistant(
+      '<advice severity="concern">reasoning: Verified by the fixture\nnote: Retain this independent remedy\nevidence: file.ts:40</advice>',
+      { tokens: { input: 500, output: 20, reasoning: 0, cache: { read: 0, write: 0 } } }),
+      response: { status: 200 } }))
+    const { runtime: subject } = runtime({ client, config: { context_budget_tokens: 100 } })
+    await subject.runPass("root", "idle")
+    client.messages.push(userMessage("user-2", "Continue the same task", 10))
+    await subject.runPass("root", "idle")
+    expect(client.creates).toHaveLength(2)
+    expect(client.prompts[1]?.body.parts[0].text).toContain("Retain this independent remedy")
+    expect(client.prompts[1]?.body.parts[0].text).toContain("file.ts:40")
+    expect(client.aborts).toHaveLength(0)
+  })
+
+  test("closed report bodies do not crowd required open remedies out of a context carry", async () => {
+    const store = new MemoryStore()
+    for (let index = 0; index < 16; index++) await store.writeNote({
+      cwd: DIRECTORY, root_session: "root", advisor_session: "child", advisor_slug: "reviewer",
+      roster_name: "Reviewer", provider: "provider", model: PRIMARY, model_display: "Primary",
+      variant: "xhigh", severity: "concern", reasoning: "checked evidence ".repeat(100),
+      note: `remedy-${index}`, evidence: ["file.ts:12"], is_fallback: false, quarantined: false,
+    })
+    const findings = await store.listFindings(DIRECTORY, "root")
+    store.listFindings = async () => findings.map((finding, index) => index < 12
+      ? { ...finding, state: "resolved", disposition: { state: "resolved", reason: "fixed",
+        reviewed_revision: finding.reviewed_revision, evidence: [], time: finding.updated_at } } : finding)
+    const requested: string[] = []
+    const read = store.readNotes.bind(store)
+    store.readNotes = async (cwd, root, ids) => { requested.push(...ids); return read(cwd, root, ids) }
+    const carried = await carryFindings(store, DIRECTORY, "root", "reviewer", undefined, 24000)
+    expect(carried).toBeDefined()
+    expect(carried).toContain("remedy-15")
+    expect(carried).toContain("resolved")
+    expect(carried).toContain("fixed")
+    expect(requested).toHaveLength(4)
+    expect(carried?.length).toBeLessThanOrEqual(24000)
+  })
+
+  test("an oversized carry pauses visibly without discarding evidence or adding tools", async () => {
+    const client = new FakeClient()
+    client.promptScripts.push(async () => ({ data: assistant(
+      `<advice severity="concern">reasoning: checked\nnote: ${"preserve this remedy ".repeat(100)}\nevidence: file.ts</advice>`,
+      { tokens: { input: 500, output: 20, reasoning: 0, cache: { read: 0, write: 0 } } }),
+      response: { status: 200 } }))
+    const { runtime: subject, store } = runtime({ client, config: { context_budget_tokens: 100, context_carry_chars: 100 } })
+    await subject.runPass("root", "idle")
+    client.messages.push(userMessage("user-2", "Continue", 10))
+    expect((await subject.runPass("root", "idle"))[0]?.outcome).toBe("context_budget_exceeded")
+    expect(client.prompts).toHaveLength(1)
+    expect(store.notes).toHaveLength(1)
+  })
+
+  test.each(["content-filter", "content_filter"])("an empty %s finish uses the configured fallback", async (finish) => {
+    const client = new FakeClient()
+    client.promptScripts.push(
+      async () => ({ data: assistant("", { finish }), response: { status: 200 } }),
+      async () => ({ data: assistant("<silent/>"), response: { status: 200 } }),
+    )
+    const { runtime: subject, store } = runtime({ client })
+    expect((await subject.runPass("root", "idle"))[0]?.outcome).toBe("fallback")
+    expect(client.prompts.map((call) => call.body.agent)).toEqual(["advisor-reviewer", "advisor-reviewer-fb"])
+    expect(store.transcripts.map((record) => record.failure_kind)).toContain("content_filter")
+  })
+
+  test("the default fallback margin defers a retry that has only two seconds left", async () => {
+    let now = 0
+    const client = new FakeClient()
+    client.promptScripts.push(async () => {
+      now = 38000
+      return { error: "429 throttled", response: { status: 429 } }
+    })
+    const subject = runtime({ client, clock: () => now,
+      config: { pass_timeout_ms: 40000, min_fallback_budget_ms: DEFAULTS.min_fallback_budget_ms } })
+    try {
+      await subject.runtime.runPass("root", "idle")
+      expect(client.prompts).toHaveLength(1)
+      await subject.runtime.runPass("root", "idle")
+      expect(client.prompts[1]?.body.agent).toBe("advisor-reviewer-fb")
+    } finally { await subject.runtime.dispose() }
+  })
+
+  test.each(["429 TooManyRequests: upstream throttled", "response blocked by content filter"])(
+    "an upstream retry event switches to fallback after confirmed abort: %s", async (message) => {
+      const client = new FakeClient()
+      client.promptScripts.push(() => new Promise(() => {}), async () => ({ data: assistant("<silent/>"), response: { status: 200 } }))
+      const { runtime: subject } = runtime({ client })
+      const pass = subject.runPass("root", "idle")
+      await until(() => client.prompts.length === 1)
+      subject.observe({ type: "session.status", properties: { sessionID: "advisor-session-1",
+        status: { type: "retry", attempt: 1, message, next: 2000 } } })
+      expect((await pass)[0]?.outcome).toBe("fallback")
+      expect(client.aborts.map((call) => call.path.id)).toEqual(["advisor-session-1"])
+      expect(client.prompts[1]?.body.agent).toBe("advisor-reviewer-fb")
+    })
+
+  test("a stalled report write releases the caller without replaying the provider, then delivers once", async () => {
+    const timers = new FakeTimers()
+    const store = new MemoryStore()
+    const writing = Promise.withResolvers<void>()
+    let saving = false
+    const write = store.writeNote.bind(store)
+    store.writeNote = async (input) => { saving = true; await writing.promise; return write(input) }
+    const client = new FakeClient()
+    client.promptScripts.push(async () => ({ data: assistant(
+      '<advice severity="concern">reasoning: checked\nnote: Keep the independent fix\nevidence: test</advice>'),
+      response: { status: 200 } }))
+    const { runtime: subject } = runtime({ client, store, timers })
+    const delivered: Note[] = []
+    let done = false
+    const pass = subject.runPass("root", "idle", { onResult: (result) => { delivered.push(...result.notes) } })
+      .then((result) => { done = true; return result })
+    await until(() => saving)
+    timers.fireAll()
+    for (let i = 0; i < 80; i++) await Promise.resolve()
+    expect(done).toBe(true)
+    expect((await pass)[0]?.persistence).toBe("pending")
+    await subject.runPass("root", "idle")
+    expect(client.prompts).toHaveLength(1)
+    writing.resolve()
+    await until(() => delivered.length === 1)
+    expect(store.notes).toHaveLength(1)
+    expect(client.aborts).toHaveLength(0)
+    await subject.dispose()
+  })
+
+  test("uncertain cancellation backs off and reconciles the child before permitting another prompt", async () => {
+    let now = 1_000
+    const timers = new FakeTimers()
+    const client = new FakeClient()
+    client.abortScript = async () => ({ error: "not acknowledged" })
+    client.promptScripts.push(() => new Promise(() => {}))
+    const { runtime: subject } = runtime({ client, timers, clock: () => now, config: { cooldown_ms: 1000 } })
+    const pass = subject.runPass("root", "idle")
+    await until(() => client.prompts.length === 1)
+    timers.fireAll()
+    expect((await pass)[0]?.cancellation).toBe("cancellation_uncertain")
+    await subject.runPass("root", "idle")
+    expect(client.aborts).toHaveLength(1)
+    now += 1001
+    client.abortScript = async () => ({ data: true, response: { status: 200 } })
+    await subject.runPass("root", "idle")
+    expect(client.aborts).toHaveLength(2)
+    expect(client.prompts).toHaveLength(2)
+    await subject.dispose()
+  })
+
+  test("new work starts another fast review while a slower reviewer is still running", async () => {
+    const client = new FakeClient()
+    const slow = Promise.withResolvers<ReturnTypeData>()
+    client.promptScripts.push(
+      async () => ({ data: assistant("<silent/>"), response: { status: 200 } }),
+      () => slow.promise,
+      async () => ({ data: assistant("<silent/>"), response: { status: 200 } }),
+    )
+    const { runtime: subject } = runtime({
+      client, roster: [entry("Fast"), entry("Slow")], config: { cooldown_ms: 0, pass_debounce_ms: 0 },
+    })
+    const completed: string[] = []
+    const context = { onResult: (result: { slug: string }) => { completed.push(result.slug) } }
+    subject.notify("root", "idle", context)
+    await until(() => client.prompts.length === 2 && completed.includes("fast"))
+    client.messages.push(watchedAssistant("edit-2", [editPart("edit-2", "src/fix.ts")], 10))
+    subject.notify("root", "idle", context)
+    await until(() => client.prompts.length === 3)
+    expect(client.prompts[2]?.body.agent).toBe("advisor-fast")
+    expect(completed).not.toContain("slow")
+    slow.resolve({ data: assistant("<silent/>"), response: { status: 200 } })
+    await until(() => completed.filter((slug) => slug === "slow").length === 1)
+    expect(client.aborts).toHaveLength(0)
+    await subject.dispose()
+  })
+
+  test.each(["history", "create"] as const)("the execution deadline includes a hung %s phase", async (phase) => {
+    const timers = new FakeTimers()
+    const client = new FakeClient()
+    if (phase === "history") client.messagesScript = () => new Promise(() => {})
+    else client.createScript = () => new Promise(() => {})
+    const { runtime: subject } = runtime({ client, timers })
+    let done = false
+    const pass = subject.runPass("root", "idle").then((value) => { done = true; return value })
+    for (let index = 0; index < 30; index++) await Promise.resolve()
+    timers.fireAll()
+    for (let index = 0; index < 50; index++) await Promise.resolve()
+    expect(done).toBe(true)
+    expect((await pass)[0]?.outcome).toBe("timeout")
+    expect(client.prompts).toHaveLength(0)
+    expect(client.aborts).toHaveLength(0)
+  })
+
+  test("a hung abort cannot keep a timed-out pass pending or permit an overlapping retry", async () => {
+    const timers = new FakeTimers()
+    const client = new FakeClient()
+    const releaseAbort = Promise.withResolvers<Awaited<ReturnType<AdvisorClient["session"]["abort"]>>>()
+    client.abortScript = () => releaseAbort.promise
+    client.promptScripts.push(() => new Promise<ReturnTypeData>(() => {}))
+    const { runtime: subject } = runtime({ client, timers })
+    let finished = false
+    const first = subject.runPass("root", "idle").then((value) => { finished = true; return value })
+    try {
+      await until(() => client.prompts.length === 1)
+      timers.fireAll()
+      await until(() => client.aborts.length === 1)
+      timers.fireAll()
+      for (let index = 0; index < 50; index++) await Promise.resolve()
+      expect(finished).toBe(true)
+      expect((await first)[0]?.outcome).toBe("timeout")
+      await subject.runPass("root", "idle")
+      expect(client.prompts).toHaveLength(1)
+    } finally {
+      releaseAbort.resolve({ data: true, response: { status: 200 } })
+    }
+  })
+
   test("emits a completed reviewer immediately and still delivers the slower reviewer's alternative", async () => {
     const fast = Promise.withResolvers<ReturnTypeData>()
     const slow = Promise.withResolvers<ReturnTypeData>()
@@ -438,7 +1110,7 @@ describe("AdvisorRuntime", () => {
     expect(results.map(({ outcome }) => outcome)).toEqual(["ok", "ok"])
     expect(store.notes).toHaveLength(2)
     expect(store.transcripts).toHaveLength(2)
-    expect(store.states).toHaveLength(1)
+    expect(store.states.at(-1)?.advisors.map((advisor) => advisor.passes)).toEqual([1, 1])
     await subject.runPass("root", "idle", {})
     expect(client.prompts).toHaveLength(2)
   })
@@ -508,7 +1180,7 @@ describe("AdvisorRuntime", () => {
     await subject.runPass("root", "idle", {})
 
     // Then
-    expect(store.states[0]?.advisors[0]?.cooled_until).toBe(
+    expect(store.states.at(-1)?.advisors[0]?.cooled_until).toBe(
       new Date(now + DEFAULTS.fallback_cooldown_ms).toISOString(),
     )
   })
@@ -612,19 +1284,22 @@ describe("AdvisorRuntime", () => {
 
   test("aborts timed-out prompts, releases the guard, and does not advance the cursor", async () => {
     // Given
+    let now = 1000
     const timers = new FakeTimers()
     const client = new FakeClient()
     client.promptScripts.push(
       async () => new Promise<ReturnTypeData>(() => {}),
       async () => ({ data: assistant(""), response: { status: 200 } }),
     )
-    const { runtime: subject } = runtime({ client, timers })
+    const { runtime: subject } = runtime({ client, timers, clock: () => now, config: { cooldown_ms: 1000 } })
 
     // When
     const first = subject.runPass("root", "idle", {})
-    await until(() => timers.pending.size === 1)
+    await until(() => client.prompts.length === 1)
     timers.fireAll()
     const firstResult = await first
+    expect(await subject.runPass("root", "idle", {})).toEqual([])
+    now += 1001
     const secondResult = await subject.runPass("root", "idle", {})
 
     // Then

@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test"
+import { describe, expect, spyOn, test } from "bun:test"
 import { existsSync } from "node:fs"
 import { mkdtemp, readFile, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
@@ -19,6 +19,8 @@ import type { LogFields, Logger, LoggerOptions } from "../src/log"
 import { NoteStore } from "../src/notes"
 import { TaskContexts } from "../src/advisor/context"
 import { checkpointTool } from "../src/plugin/checkpoint"
+import { ReviewJournal } from "../src/advisor/journal"
+import { UsageLedger } from "../src/usage/ledger"
 
 const NOW = 1_789_000_000_000
 const ROOT_ID = "root-session"
@@ -285,6 +287,122 @@ async function until(predicate: () => boolean): Promise<void> {
 }
 
 describe("advisor plugin entry", () => {
+  test.each(["journal", "usage", "notes"])("shutdown closes the remaining owners when %s cleanup fails", async (failing) => {
+    const plugin = await loadPlugin()
+    if (plugin === undefined) throw new Error("Plugin module missing")
+    const harness = await makeHarness()
+    const calls: string[] = []
+    const cleanup: Array<() => Promise<void>> = []
+    const journalClose = ReviewJournal.prototype.close
+    const usageClose = UsageLedger.prototype.close
+    const notesClose = NoteStore.prototype.close
+    const journalSpy = spyOn(ReviewJournal.prototype, "close").mockImplementation(function (this: ReviewJournal) {
+      calls.push("journal")
+      cleanup.push(() => journalClose.call(this))
+      return failing === "journal" ? Promise.reject(new Error("Journal release failed")) : journalClose.call(this)
+    })
+    const usageSpy = spyOn(UsageLedger.prototype, "close").mockImplementation(function (this: UsageLedger) {
+      calls.push("usage")
+      cleanup.push(() => usageClose.call(this))
+      return failing === "usage" ? Promise.reject(new Error("Usage close failed")) : usageClose.call(this)
+    })
+    const notesSpy = spyOn(NoteStore.prototype, "close").mockImplementation(function (this: NoteStore) {
+      calls.push("notes")
+      cleanup.push(() => notesClose.call(this))
+      return failing === "notes" ? Promise.reject(new Error("Note store close failed")) : notesClose.call(this)
+    })
+    try {
+      const hooks = await plugin.createAdvisorHooks({ client: new FakeClient(), directory: harness.directory }, {
+        ...harness.dependencies, createLogger: (options) => ({
+          ...harness.dependencies.createLogger(options),
+          close: async () => { calls.push("log") },
+        }),
+      })
+      await hooks.event?.({ event: { type: "server.instance.disposed", properties: { directory: harness.directory } } })
+      expect(calls).toEqual(["journal", "usage", "notes", "log"])
+      expect(harness.logs.some(({ fields }) => fields["msg"] === "advisor shutdown cleanup failed" &&
+        fields["resource"] === failing)).toBe(true)
+    } finally {
+      journalSpy.mockRestore()
+      usageSpy.mockRestore()
+      notesSpy.mockRestore()
+      await Promise.allSettled(cleanup.map((close) => close()))
+      await removeHarness(harness.temporaryRoot)
+    }
+  })
+
+  test("checkpoint completion returns while requested advisor recovery is still pending", async () => {
+    const harness = await makeHarness()
+    const client = new FakeClient()
+    const log = harness.dependencies.createLogger({ level: "info" })
+    const store = new NoteStore({ dataDir: join(harness.temporaryRoot, "checkpoint-data"), log })
+    const release = Promise.withResolvers<void>()
+    let recovering = false
+    let completed = false
+    const checkpoint = checkpointTool({
+      client, config: { abort_on_blocker: false }, contexts: new TaskContexts(store, harness.directory),
+      log, store, directory: harness.directory, isWatched: () => true,
+      recover: async () => { recovering = true; await release.promise; throw new Error("Recovery unavailable") },
+    })
+    const work = checkpoint.execute({ phase: "complete", task: "continue", updates: [], recover: true }, {
+      sessionID: ROOT_ID, messageID: "checkpoint", agent: "build", directory: harness.directory,
+      worktree: harness.directory, abort: new AbortController().signal, metadata: () => {}, ask: async () => {},
+    }).then((result) => { completed = true; return result })
+    void work.catch(() => {})
+    try {
+      await until(() => recovering)
+      await until(() => completed)
+      expect(await work).toContain('"completion_allowed":true')
+      expect(await work).toContain('"recovery_requested":true')
+      expect(client.abortCalls).toEqual([])
+      release.resolve()
+      await until(() => harness.logs.some(({ fields }) => fields["msg"] === "advisor background recovery failed"))
+    } finally {
+      release.resolve()
+      await work.catch(() => {})
+      await store.close()
+      await removeHarness(harness.temporaryRoot)
+    }
+  })
+
+  test("the primary can continue and complete with an unfinished advisor", async () => {
+    const plugin = await loadPlugin()
+    if (plugin === undefined) throw new Error("Plugin module missing")
+    const harness = await makeHarness()
+    const fake = new FakeClient()
+    const release = Promise.withResolvers<void>()
+    let prompted = false
+    let returned = false
+    const client = { ...fake, session: { ...fake.session, prompt: async () => {
+      prompted = true
+      await release.promise
+      returned = true
+      return { data: advisorResponse(), error: undefined, response: new Response() }
+    } } }
+    const hooks = await plugin.createAdvisorHooks({ client, directory: harness.directory }, harness.dependencies)
+    try {
+      await hooks.event?.({ event: sessionCreated(harness.directory) })
+      await hooks.event?.({ event: sessionIdle() })
+      await until(() => prompted)
+      const output = { messages: [{ ...userTranscriptMessage(ROOT_SENTINEL), parts: [] as Part[] }] }
+      await hooks["experimental.chat.messages.transform"]?.({}, output)
+      const checkpoint = hooks.tool?.["advisor_checkpoint"]
+      if (checkpoint === undefined) throw new Error("Checkpoint tool missing")
+      const report = await checkpoint.execute({ phase: "complete", task: "continue", updates: [] }, {
+        sessionID: ROOT_ID, messageID: "checkpoint", agent: "build", directory: harness.directory,
+        worktree: harness.directory, abort: new AbortController().signal, metadata: () => {}, ask: async () => {},
+      })
+      expect(report).toContain('"completion_allowed":true')
+      expect(returned).toBe(false)
+      expect(fake.abortCalls).toEqual([])
+    } finally {
+      release.resolve()
+      await until(() => harness.logs.some(({ fields }) => fields["msg"] === "advisor pass end"))
+      await hooks.event?.({ event: { type: "server.instance.disposed", properties: { directory: harness.directory } } })
+      await removeHarness(harness.temporaryRoot)
+    }
+  })
+
   test("a checkpoint awaiting reports cannot abort after its instance is disposed", async () => {
     const harness = await makeHarness()
     const client = new FakeClient()
@@ -434,13 +552,13 @@ describe("advisor plugin entry", () => {
       expect(JSON.stringify(output)).toContain("Fix 1")
       expect(slowDone).toBeFalse()
       slow.resolve()
-      await until(() => harness.logs.some(({ fields }) => fields["msg"] === "advisor pass end"))
+      await until(() => harness.logs.filter(({ fields }) => fields["msg"] === "advisor card withheld").length === 2)
       await hooks["experimental.chat.messages.transform"]?.({}, output)
       expect(JSON.stringify(output)).toContain("Fix 2")
       expect(fake.abortCalls).toHaveLength(0)
     } finally {
       slow.resolve()
-      await until(() => harness.logs.some(({ fields }) => fields["msg"] === "advisor pass end"))
+      await until(() => harness.logs.filter(({ fields }) => fields["msg"] === "advisor card withheld").length === 2)
       await removeHarness(harness.temporaryRoot)
     }
   })

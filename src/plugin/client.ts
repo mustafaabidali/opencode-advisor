@@ -46,6 +46,12 @@ export type AdvisorPluginClient = Readonly<{
     messages: (
       call: Parameters<AdvisorClient["session"]["messages"]>[0],
     ) => Promise<ClientResult<MessageResponse>>
+    message?: (
+      call: Parameters<NonNullable<AdvisorClient["session"]["message"]>>[0],
+    ) => Promise<ClientResult<MessageResponse[number]>>
+    status?: (
+      call: Parameters<NonNullable<AdvisorClient["session"]["status"]>>[0],
+    ) => Promise<ClientResult<Readonly<Record<string, { type: string }>>>>
     prompt: (
       call: Parameters<AdvisorClient["session"]["prompt"]>[0],
     ) => Promise<ClientResult<PromptResponse>>
@@ -122,12 +128,15 @@ export function adaptPluginClient(
         normalizeClientResult(
           await client.session.messages({
             path: { id: call.path.id },
-            query: { directory: call.query.directory },
+            query: { directory: call.query.directory, ...(call.query.limit === undefined ? {} : { limit: call.query.limit }) },
           }),
         ),
+      message: async (call) => normalizeClientResult(await client.session.message(call)),
+      status: async (call) => normalizeClientResult(await client.session.status(call)),
       prompt: async (call) =>
         normalizeClientResult(
           await client.session.prompt({
+            ...(call.signal === undefined ? {} : { signal: call.signal }),
             path: { id: call.path.id },
             query: { directory: call.query.directory },
             body: {
@@ -183,6 +192,10 @@ export function toAdvisorClient(client: AdvisorPluginClient): AdvisorClient {
       create: async (call) => optionalResult(await client.session.create(call)),
       messages: async (call) =>
         optionalResult(await client.session.messages(call)),
+      message: async (call) => client.session.message === undefined
+        ? { error: new Error("Message reads unavailable") } : optionalResult(await client.session.message(call)),
+      status: async (call) => client.session.status === undefined
+        ? { error: new Error("Session status unavailable") } : optionalResult(await client.session.status(call)),
       prompt: async (call) => optionalResult(await client.session.prompt(call)),
       abort: async (call) => optionalResult(await client.session.abort(call)),
     },
