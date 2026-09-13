@@ -65,13 +65,18 @@ export class JournalLane {
     }
   }
   begin(pending: PendingPass, generation: number): Promise<void> {
-    return this.#save(() => ({ ...this.#data, fingerprint: this.fingerprint,
-      cursor: this.compatible ? this.#data.cursor : {}, generation, pending }))
+    return this.#save(() => ({ fingerprint: this.fingerprint,
+      cursor: this.compatible ? this.#data.cursor : {}, generation, pending,
+      ...(this.compatible && this.#data.content !== undefined ? { content: this.#data.content } : {}) }))
   }
   settle(id: string, cursor?: Cursor): Promise<void> {
-    return this.#save(() => this.#data.pending?.id !== id ? this.#data : ({
-      ...this.#data, fingerprint: this.fingerprint, cursor: cursor ?? this.#data.cursor, pending: null,
-    }))
+    return this.#save(() => {
+      if (this.#data.pending?.id !== id) return this.#data
+      const { content: previousContent, ...previous } = this.#data
+      const content = cursor === undefined ? (this.compatible ? previousContent : undefined) : this.#data.pending.content
+      return { ...previous, fingerprint: this.fingerprint, cursor: cursor ?? (this.compatible ? previous.cursor : {}), pending: null,
+        ...(content === undefined ? {} : { content }) }
+    })
   }
   #save(next: () => JournalData): Promise<void> {
     const work = this.#writing.then(async () => {

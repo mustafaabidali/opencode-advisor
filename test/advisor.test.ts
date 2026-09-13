@@ -21,6 +21,7 @@ import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { Watcher } from "../src/watcher"
+import { sliceDelta } from "../src/delta"
 
 const DIRECTORY = "/workspace/project"
 const PRIMARY = "amazon-bedrock/openai.gpt-5.6-sol"
@@ -248,6 +249,7 @@ function runtime(options: Readonly<{
   logger?: Logger
   config?: Partial<AdvisorConfig>
   journal?: ReviewJournal
+  captureContent?: () => Promise<string | undefined>
 }> = {}): { runtime: AdvisorRuntime; client: FakeClient; store: MemoryStore } {
   const client = options.client ?? new FakeClient()
   const store = options.store ?? new MemoryStore()
@@ -264,6 +266,7 @@ function runtime(options: Readonly<{
       clock: options.clock ?? (() => 1_000),
       timers: options.timers ?? new FakeTimers(),
       ...(options.journal === undefined ? {} : { journal: options.journal }),
+      ...(options.captureContent === undefined ? {} : { captureContent: options.captureContent }),
       ...(options.onResult === undefined ? {} : { onResult: options.onResult }),
       readFile: async () => "project guidance",
       onAdvisorSession: () => {},
@@ -279,6 +282,200 @@ function runtime(options: Readonly<{
 }
 
 describe("AdvisorRuntime", () => {
+  test("a file reviewer skips already reviewed contents and reviews the next change", async () => {
+    let contents = "contents-a"
+    const client = new FakeClient()
+    const { runtime: subject } = runtime({
+      client, captureContent: async () => contents,
+      roster: [resolved({ name: "Reviewer", when: { edits: ["**/*.ts"], commands: [], tools: [] } })],
+    })
+    client.messages.push(watchedAssistant("edit-1", [editPart("edit-1", "src/a.ts")], 2))
+    await subject.runPass("root", "idle")
+    expect(client.prompts).toHaveLength(1)
+
+    client.messages.push(watchedAssistant("noop-2", [editPart("noop-2", "src/a.ts")], 4))
+    expect(await subject.runPass("root", "idle")).toEqual([])
+    expect(client.prompts).toHaveLength(1)
+
+    contents = "contents-b"
+    client.messages.push(watchedAssistant("edit-3", [editPart("edit-3", "src/a.ts")], 6))
+    await subject.runPass("root", "idle")
+    expect(client.prompts).toHaveLength(2)
+    await subject.dispose()
+  })
+
+  test("a successful content baseline survives release and restart of its reviewer", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "advisor-content-journal-"))
+    const journal = new ReviewJournal(dataDir, DIRECTORY)
+    const client = new FakeClient()
+    const options = {
+      journal, client, captureContent: async () => "contents-a",
+      roster: [resolved({ name: "Reviewer", when: { edits: ["**/*.ts"], commands: [], tools: [] } })],
+    }
+    const first = runtime(options).runtime
+    let second: AdvisorRuntime | undefined
+    try {
+      client.messages.push(watchedAssistant("edit-1", [editPart("edit-1", "src/a.ts")], 2))
+      await first.runPass("root", "idle")
+      await first.dispose()
+
+      second = runtime(options).runtime
+      client.messages.push(watchedAssistant("noop-2", [editPart("noop-2", "src/a.ts")], 4))
+      expect(await second.runPass("root", "idle")).toEqual([])
+      expect(client.prompts).toHaveLength(1)
+    } finally {
+      await first.dispose()
+      await second?.dispose()
+      await journal.close()
+      await rm(dataDir, { recursive: true, force: true })
+    }
+  })
+
+  test("restart recovery accepts the pending pass's captured contents without another provider request", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "advisor-content-recovery-"))
+    const journal = new ReviewJournal(dataDir, DIRECTORY)
+    const reviewer = resolved({ name: "Reviewer", when: { edits: ["**/*.ts"], commands: [], tools: [] } })
+    const client = new FakeClient()
+    client.messages.push(watchedAssistant("edit-1", [editPart("edit-1", "src/a.ts")], 2))
+    const pending = journal.lane("root", reviewer.slug, { entry: reviewer, config: config() })
+    let contents = "contents-a"
+    const subject = runtime({ journal, client, roster: [reviewer], captureContent: async () => contents }).runtime
+    try {
+      await pending.load()
+      await pending.begin({
+        id: "interrupted-pass", child: "recovered-child", model: DEFAULT_MODEL, agent: reviewer.agentId,
+        started_at: 1_000, next: sliceDelta(client.messages, {}).next,
+        content: JSON.stringify([undefined, "user-1", "contents-a"]),
+      }, 0)
+      await pending.close()
+      client.messagesScript = async (call) => ({
+        data: call.path.id === "recovered-child" ? [assistant("<silent/>", {
+          sessionID: "recovered-child", mode: reviewer.agentId, finish: "stop",
+          time: { created: 1_001, completed: 1_002 },
+        })] : client.messages,
+        response: { status: 200 },
+      })
+      await subject.runPass("root", "idle")
+      await subject.recover("root")
+      client.messages.push(watchedAssistant("noop-2", [editPart("noop-2", "src/a.ts")], 4))
+      await subject.runPass("root", "idle")
+      expect(client.prompts).toHaveLength(0)
+
+      contents = "contents-b"
+      client.messages.push(watchedAssistant("edit-3", [editPart("edit-3", "src/a.ts")], 6))
+      await subject.runPass("root", "idle")
+      expect(client.prompts).toHaveLength(1)
+    } finally {
+      await subject.dispose()
+      await journal.close()
+      await rm(dataDir, { recursive: true, force: true })
+    }
+  })
+
+  test("an unrestricted transcript reviewer does not scan or deduplicate file contents", async () => {
+    let scans = 0
+    const { runtime: subject, client } = runtime({
+      captureContent: async () => { scans++; return "contents-a" },
+    })
+    await subject.runPass("root", "idle")
+    client.messages.push(watchedAssistant("analysis-2", [textPart("analysis-2", "New evidence")], 2))
+    await subject.runPass("root", "idle")
+    expect(client.prompts).toHaveLength(2)
+    expect(scans).toBe(0)
+    await subject.dispose()
+  })
+
+  test("an explicit tool trigger still reviews new evidence when file contents are unchanged", async () => {
+    const { runtime: subject, client } = runtime({
+      captureContent: async () => "contents-a",
+      roster: [resolved({ name: "Reviewer", when: { edits: ["**/*.ts"], commands: [], tools: ["task"] } })],
+    })
+    client.messages.push(watchedAssistant("edit-1", [editPart("edit-1", "src/a.ts")], 2))
+    await subject.runPass("root", "idle")
+    client.messages.push(watchedAssistant("task-2", [{
+      id: "task-2", sessionID: "root", messageID: "task-2", type: "tool", callID: "task", tool: "task",
+      state: { status: "completed", input: { description: "Review the design" }, output: "New design evidence",
+        title: "Design review", metadata: {}, time: { start: 3, end: 4 } },
+    }], 4))
+    await subject.runPass("root", "idle")
+    expect(client.prompts).toHaveLength(2)
+    await subject.dispose()
+  })
+
+  test("content baselines belong to each reviewer and do not suppress new user requirements", async () => {
+    const roster = ["Fast", "Slow"].map((name) =>
+      resolved({ name, when: { edits: ["**/*.ts"], commands: [], tools: [] } }))
+    const { runtime: subject, client } = runtime({ roster, captureContent: async () => "contents-a" })
+    client.messages.push(watchedAssistant("edit-1", [editPart("edit-1", "src/a.ts")], 2))
+    await subject.runPass("root", "idle", { advisorSlug: "fast" })
+    await subject.runPass("root", "idle")
+    expect(client.prompts).toHaveLength(2)
+
+    client.messages.push(userMessage("user-2", "Preserve the existing public interface", 5))
+    client.messages.push(watchedAssistant("noop-2", [editPart("noop-2", "src/a.ts")], 6))
+    await subject.runPass("root", "idle")
+    expect(client.prompts).toHaveLength(4)
+    await subject.dispose()
+  })
+
+  test.each(["unavailable", "error"])("an %s content check permits review and clears stale deduplication state", async (mode) => {
+    let known = true
+    const { runtime: subject, client } = runtime({
+      captureContent: async () => {
+        if (known) return "contents-a"
+        if (mode === "error") throw new Error("Unable to inspect worktree")
+        return undefined
+      },
+      roster: [resolved({ name: "Reviewer", when: { edits: ["**/*.ts"], commands: [], tools: [] } })],
+    })
+    client.messages.push(watchedAssistant("edit-1", [editPart("edit-1", "src/a.ts")], 2))
+    await subject.runPass("root", "idle")
+    known = false
+    client.messages.push(watchedAssistant("edit-2", [editPart("edit-2", "src/a.ts")], 4))
+    await subject.runPass("root", "idle")
+    known = true
+    client.messages.push(watchedAssistant("edit-3", [editPart("edit-3", "src/a.ts")], 6))
+    await subject.runPass("root", "idle")
+    expect(client.prompts).toHaveLength(3)
+    await subject.dispose()
+  })
+
+  test("a failed provider request does not mark its contents reviewed", async () => {
+    const { runtime: subject, client } = runtime({
+      config: { fallback_cooldown_ms: 0 }, captureContent: async () => "contents-a",
+      roster: [resolved({ name: "Reviewer", fallback: DEFAULT_MODEL,
+        when: { edits: ["**/*.ts"], commands: [], tools: [] } })],
+    })
+    client.promptScripts.push(async () => ({ error: "Provider unavailable", response: { status: 500 } }))
+    client.messages.push(watchedAssistant("edit-1", [editPart("edit-1", "src/a.ts")], 2))
+    expect((await subject.runPass("root", "idle"))[0]?.outcome).toBe("error")
+    await subject.runPass("root", "idle")
+    expect(client.prompts).toHaveLength(2)
+    await subject.dispose()
+  })
+
+  test("an edit during review gets a background follow-up against its own content snapshot", async () => {
+    let contents = "contents-a"
+    let finish: (result: ReturnTypeData) => void = () => { throw new Error("Review not started") }
+    const { runtime: subject, client } = runtime({
+      config: { pass_debounce_ms: 0, cooldown_ms: 0 }, captureContent: async () => contents,
+      roster: [resolved({ name: "Reviewer", when: { edits: ["**/*.ts"], commands: [], tools: [] } })],
+    })
+    client.promptScripts.push(() => new Promise((resolve) => { finish = resolve }))
+    client.messages.push(watchedAssistant("edit-1", [editPart("edit-1", "src/a.ts")], 2))
+    expect(subject.notify("root", "idle")).toBeUndefined()
+    await until(() => client.prompts.length === 1)
+
+    contents = "contents-b"
+    client.messages.push(watchedAssistant("edit-2", [editPart("edit-2", "src/a.ts")], 4))
+    expect(subject.notify("root", "idle")).toBeUndefined()
+    expect(client.prompts).toHaveLength(1)
+    finish({ data: assistant("<silent/>"), response: { status: 200 } })
+    await until(() => client.prompts.length === 2)
+    expect(client.prompts).toHaveLength(2)
+    await subject.dispose()
+  })
+
   test("a local journal failure is not sent, does not cool models, and does not consume fallback", async () => {
     const dataDir = await mkdtemp(join(tmpdir(), "advisor-local-failure-"))
     const usage = new UsageLedger({ dataDir, directory: DIRECTORY, clock: () => 1000 })

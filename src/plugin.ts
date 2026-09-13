@@ -1,9 +1,9 @@
 import type { Hooks, Plugin } from "@opencode-ai/plugin"
 import type { Config as SdkConfig } from "@opencode-ai/sdk"
 import { join } from "node:path"
-
 import { AdvisorRuntime } from "./advisor"
 import { TaskContexts } from "./advisor/context"
+import { WorktreeContents } from "./advisor/content"
 import { loadConfig, resolveDataDir } from "./config"
 import { Deliverer } from "./deliver"
 import { createLogger } from "./log"
@@ -33,7 +33,7 @@ import { ReviewJournal } from "./advisor/journal"
 import { buildIdentity } from "./identity"
 import { logStartup } from "./plugin/startup"
 
-export type AdvisorPluginInput = Readonly<{ client: AdvisorPluginClient; directory: string }>
+export type AdvisorPluginInput = Readonly<{ client: AdvisorPluginClient; directory: string; worktree?: string }>
 
 export async function createAdvisorHooks(
   input: AdvisorPluginInput,
@@ -110,6 +110,7 @@ export async function createAdvisorHooks(
       onAdvisorSession: (id) => watcher?.markAdvisorSession(id),
       onResult: (sessionID, result) => disposed ? undefined : deliverer.deliver(sessionID, result.notes),
       captureReview: (sessionID, messages) => contexts.capture(sessionID, messages),
+      captureContent: new WorktreeContents(input.directory, input.worktree).capture,
       onWarning: (advisor, message) =>
         showRuntimeWarning(input.client, log, advisor, message),
     })
@@ -232,9 +233,9 @@ export async function createAdvisorHooks(
   }
 }
 
-export const server: Plugin = async ({ client, directory }) => {
+export const server: Plugin = async ({ client, directory, worktree }) => {
   try {
-    return await createAdvisorHooks({ client: adaptPluginClient(client), directory })
+    return await createAdvisorHooks({ client: adaptPluginClient(client), directory, worktree })
   } catch (error) {
     const cause = error instanceof Error ? error : new TypeError("unknown advisor factory failure")
     await createLogger({ level: "info" }).error({

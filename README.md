@@ -102,6 +102,12 @@ Position 4 lets an existing omp roster work unchanged. With no roster at all, on
 
 A skipped delta carries over: the reviewer's cursor does not move, no child session or prompt is created, and when a later step matches it reviews everything since its last pass, within `max_delta_chars`. The log records `advisor pass skipped` with `reason: no_trigger`. A `when` whose lists are empty or all invalid fails closed: the entry stays in the roster, never runs, and a startup warning says so. An edit outside the watched directory matches extension globs (`**/*.jsonc`) but not prefix globs (`src/**`). Passes are per completed assistant step, batched by `pass_debounce_ms` and `cooldown_ms`, so several edits in one step share one pass.
 
+File- and command-triggered reviewers also skip a pass when file contents and user/task context match that reviewer's last successful review. The first eligible pass establishes this baseline. Later no-op edits, staging, and commits of already-reviewed contents need no new model request; the log records `reason: unchanged_content`. Checks include tracked and untracked file contents, file modes, and explicit edit/patch paths outside the worktree. Skipped transcript evidence carries forward.
+
+Baselines belong to individual reviewers and persist in the review journal. They are captured before a request and accepted only with its successful durable result, including recovery. Failures do not mark code reviewed. A new user request or changed reviewer configuration permits a fresh review, and edits arriving during review remain eligible for the coalesced follow-up. An unrestricted reviewer with no `when`, or an explicit match in `when.tools`, still reviews transcript evidence even when files are unchanged.
+
+Content checks run in the background and share cached file hashes. Each check is limited to two seconds, 10,000 files, 4 MiB per file, and 64 MiB in total. Outside Git, or when paths are unknown, files are unreadable or changing during inspection, symlinks/submodules are encountered, or a limit is exceeded, the check declines deduplication and normal review remains available. The primary never waits for these checks.
+
 A quiet code reviewer and a docs reviewer that also records nits:
 
 ```yaml

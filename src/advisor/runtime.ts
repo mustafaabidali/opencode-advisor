@@ -169,7 +169,11 @@ export class AdvisorRuntime {
         this.#catalog(),
         this.options.captureReview?.(root, messages),
       ])
-      return { catalog, ...(review === undefined ? {} : { review }) }
+      let content: Promise<string | undefined> | undefined
+      return { catalog, ...(review === undefined ? {} : { review }),
+        captureContent: () => content ??= Promise.resolve().then(() => this.options.captureContent?.(messages))
+          .then((digest) => digest === undefined ? undefined : JSON.stringify([review?.task_id, users.at(-1)?.info.id, digest]))
+          .catch(() => undefined) }
     })()
     const users = messages.filter(({ info }) => info.role === "user" &&
       info.agent !== DELIVERY_AGENT_ID && !info.id.startsWith("adv_"))

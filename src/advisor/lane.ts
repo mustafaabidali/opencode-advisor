@@ -8,7 +8,7 @@ import { buildPassPrompt } from "../prompts"
 import { executeAdvisorPass, type PassResult } from "./pass"
 import { PendingReview } from "./recovery"
 import { ContextBudgetExceeded, ReviewChild } from "./child"
-import { shouldReview } from "./trigger"
+import { canDeduplicateContent, shouldReview } from "./trigger"
 import { committedResults } from "./commit-result"
 import { reviewStore } from "./review-store"
 import { restartRecovery } from "./restart"
@@ -21,11 +21,13 @@ import type { AdvisorRuntimeOptions, MessageResponse, ResolvedEntry } from "./ru
 export type PreparedReview = Readonly<{
   catalog: ModelCatalog
   review?: ReviewContext
+  captureContent?: () => Promise<string | undefined>
 }>
 
 /** A reviewer's cursor and uncertain request never block a different reviewer. */
 export class ReviewLane {
   #cursor: Cursor = {}
+  #content: string | undefined
   readonly #child: ReviewChild
   #running = false
   #pending: PendingReview | undefined
@@ -96,6 +98,7 @@ export class ReviewLane {
     const state = this.#journal.data
     const compatible = this.#journal.compatible
     this.#cursor = compatible ? state.cursor : {}
+    this.#content = compatible ? state.content : undefined
     this.#child.restore(state.generation)
     const pending = state.pending
     if (pending !== null) {
@@ -104,7 +107,7 @@ export class ReviewLane {
         if (this.#activePassID !== pending.id) return
         const advance = compatible && ["ok", "silent", "fallback", "quarantined"].includes(result.outcome)
         await this.#journal?.settle(pending.id, advance ? pending.next : undefined)
-        if (advance) this.#cursor = pending.next
+        if (advance) { this.#cursor = pending.next; this.#content = pending.content }
       }, this.options)
       const restored = await finish(restartRecovery(this.options, this.entry, this.root, pending))
       this.#pending = new PendingReview(restored, this.options, async (result) => {
@@ -140,6 +143,13 @@ export class ReviewLane {
     }
     try {
       const prepared = await lifetime.run(prepare)
+      const content = !canDeduplicateContent(this.entry.when, sliced.delta) ? undefined :
+        await lifetime.run(() => prepared.captureContent?.() ?? Promise.resolve(undefined))
+      if (content !== undefined && content === this.#content) {
+        await this.options.log.info({ msg: "advisor pass skipped", watchedID: this.root,
+          advisor: this.entry.slug, reason: "unchanged_content" })
+        return undefined
+      }
       const objective = messages.find((message) => message.info.id === prepared.review?.task_id)
       if (objective !== undefined) originalRequest = objective.parts.filter((part) => part.type === "text").map((part) => part.text).join("\n")
       try { await lifetime.run(() => this.#child.prepare(prepared.catalog, prepared.review)) }
@@ -168,6 +178,7 @@ export class ReviewLane {
         await this.#journal?.settle(passID, advance ? sliced.next : undefined)
         if (advance) {
           this.#cursor = sliced.next
+          this.#content = content
           this.#warnedNoModel = false
           this.#child.complete(completed, prompted)
         }
@@ -189,7 +200,8 @@ export class ReviewLane {
         onPhase: (phase) => { this.#phase = phase; this.changed() },
         ...(this.#journal === undefined ? {} : { beforeDispatch: async (child, model, agent, started_at) => {
           await this.#journal?.begin({ id: passID, child, model: `${model.long}${model.effort === undefined && model.variant === undefined ? "" : `:${model.effort ?? model.variant}`}`,
-            agent, started_at, next: sliced.next, ...(prepared.review === undefined ? {} : { review: prepared.review }) },
+            agent, started_at, next: sliced.next, ...(content === undefined ? {} : { content }),
+            ...(prepared.review === undefined ? {} : { review: prepared.review }) },
           this.#child.status.generation)
         } }),
         ...(this.options.usage === undefined ? {} : { usage: this.options.usage }),

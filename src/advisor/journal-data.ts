@@ -10,12 +10,14 @@ export type PendingPass = Readonly<{
   started_at: number
   next: Cursor
   review?: ReviewContext
+  content?: string
 }>
 export type JournalData = Readonly<{
   fingerprint: string
   cursor: Cursor
   generation: number
   pending: PendingPass | null
+  content?: string
 }>
 export type JournalRow = JournalKey & Readonly<{ owner: string | null; pid: number | null; payload: string }>
 export const EMPTY_JOURNAL: JournalData = { fingerprint: "", cursor: {}, generation: 0, pending: null }
@@ -40,13 +42,16 @@ function review(value: unknown): value is ReviewContext {
 function pending(value: unknown): value is PendingPass | null {
   return value === null || (record(value) && ["id", "child", "model", "agent"].every((key) => typeof value[key] === "string") &&
     typeof value["started_at"] === "number" && cursor(value["next"]) &&
+    (value["content"] === undefined || typeof value["content"] === "string") &&
     (value["review"] === undefined || review(value["review"])))
 }
 export function parseJournal(text: string): JournalData {
   const value: unknown = JSON.parse(text)
   if (!record(value) || typeof value["fingerprint"] !== "string" || !cursor(value["cursor"]) ||
+    (value["content"] !== undefined && typeof value["content"] !== "string") ||
     typeof value["generation"] !== "number" || !pending(value["pending"])) {
     throw new Error("Advisor journal is invalid; recovery required")
   }
-  return { fingerprint: value["fingerprint"], cursor: value["cursor"], generation: value["generation"], pending: value["pending"] }
+  return { fingerprint: value["fingerprint"], cursor: value["cursor"], generation: value["generation"], pending: value["pending"],
+    ...(value["content"] === undefined ? {} : { content: value["content"] }) }
 }

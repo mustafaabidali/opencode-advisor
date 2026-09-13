@@ -74,6 +74,8 @@ The annotated schema is `WATCHDOG.example.yml` in the plugin repository. The rul
 - Each advisor has at most one fallback. An entry that omits `fallback` uses `default_fallback`, or `default_model` when `default_fallback` is the entry's own model, or none. An explicit `fallback` equal to the entry's model is dropped with a startup warning.
 - `tools` defaults to `[read, grep, glob]`; `list` is also investigative and prompt-free. `edit`, `write`, `patch`, `multiedit`, `bash`, and `webfetch` keep their OpenCode permission prompts. Everything else, including every MCP tool, is denied. `search` means `grep`; `find` means `glob`.
 - `when` on an entry gates that reviewer: it runs only when the delta since its last pass has a completed `edit`/`write`/`apply_patch` whose path matches an `edits` glob, a completed `bash` whose command matches a `commands` regex, or a tool named in `tools`. Skipped deltas carry over. No `when` means every step. An empty or all-invalid `when` never runs and warns at startup. Name `task` in `tools` if delegated edits should trigger a pass; sub-agent sessions are not watched. Per-entry `chat_min_severity` and `inject_min_severity` override the global floors.
+- File- and command-triggered passes deduplicate against that reviewer's last successfully reviewed file contents and user/task context. The first eligible pass establishes a baseline; no-op edits and staging/commits of already-reviewed contents then log `unchanged_content` without another model request. Tracked and untracked contents, modes, and explicit external edit/patch paths are included. Baselines persist in the journal, remain independent per reviewer, and advance only with durable successful results. New requests or changed reviewer configuration permit fresh review. Skipped transcript evidence carries forward.
+- Content deduplication never suppresses unrestricted transcript reviewers or explicit `when.tools` matches, so new delegated evidence and design reviews remain available without file changes. Checks are background work, capped at two seconds, 10,000 files, 4 MiB per file, and 64 MiB total. Outside Git, or with unknown paths, unreadable/changing files, symlinks/submodules, or exceeded limits, normal review proceeds without deduplication. The primary never waits for a check.
 - `instructions` on an entry specializes that reviewer; top-level `instructions` reach every reviewer. Severity definitions and the `<silent/>` protocol come from the plugin's own reviewer contract, which wins over roster wording.
 
 Add a reviewer:
@@ -119,6 +121,7 @@ Where things live:
 - `src/advisor/runtime.ts`: schedules independent reviewers and routes arrived results to delivery.
 - `src/advisor/lane.ts`, `src/advisor/recovery.ts`, `src/advisor/child.ts`: one reviewer's cursor, active pass, child context and pending recovery. Stable pass IDs prevent older completions from advancing newer progress.
 - `src/advisor/pass.ts`, `src/advisor/attempt.ts`: provider calls, cancellation, fallback and permit release.
+- `src/advisor/content.ts`, `src/advisor/trigger.ts`: bounded file-content checks and trigger eligibility; unchanged-file hashes are shared, while each lane owns its successful content baseline.
 - `src/deliver/*`, `src/plugin/render.ts`: idle-only native cards, retry acknowledgment, turn gating, injection, and the standing rule.
 - `src/policy.ts`, `src/checkpoint.ts`, `src/notes/findings.ts`: advice eligibility, independent proposals, batch dispositions, and persisted task context.
 - `src/notes/database*.ts`, `src/notes/schema.ts`, `src/notes/queries.ts`: worker ownership, persistent SQLite connections, migrations, state versions, and scoped batch reads.
@@ -138,6 +141,7 @@ Invariants:
 
 - The primary never waits for reviewer execution or recovery, even before completion. Checkpoints inspect arrived findings.
 - Pending result publication belongs to the reviewer lane; durable lane release belongs to the journal. Keep completion watchers and ownership registries with their owner.
+- A content baseline is accepted only for the state captured before a successful review. Failed or uncertain work cannot suppress a retry, a different reviewer, new user requirements, or later edits.
 - Cards are delivered only at idle on a watched session; real user turns pause the remaining batch. Native delivery never creates a user message or prompts the primary.
 - `session.prompt` targets advisor child sessions only.
 - Delivery-agent messages and native advisor output are excluded from deltas and pass triggers.

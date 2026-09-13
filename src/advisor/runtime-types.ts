@@ -37,6 +37,7 @@ export type AdvisorRuntimeOptions = Readonly<{
   onWarning: (advisorSlug: string, message: string) => void | Promise<void>
   onResult?: (root: string, result: PassResult) => void | Promise<void>
   captureReview?: (sessionID: string, messages: readonly TranscriptMessage[]) => Promise<ReviewContext>
+  captureContent?: (messages: readonly TranscriptMessage[]) => Promise<string | undefined>
   monotonicClock?: () => number
   usage?: UsageLedger
   admission?: ProviderAdmission

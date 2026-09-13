@@ -1,6 +1,8 @@
 import { describe, expect, spyOn, test } from "bun:test"
 import { existsSync } from "node:fs"
-import { mkdtemp, readFile, rm } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { execFile } from "node:child_process"
+import { promisify } from "node:util"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -287,6 +289,54 @@ async function until(predicate: () => boolean): Promise<void> {
 }
 
 describe("advisor plugin entry", () => {
+  test("the installed hooks deduplicate unchanged files and review the next untracked edit", async () => {
+    const plugin = await loadPlugin()
+    if (plugin === undefined) throw new Error("Plugin module missing")
+    const harness = await makeHarness({
+      readFile: (path) => path.endsWith("advisor.jsonc") ? Promise.resolve(JSON.stringify({
+        default_model: "amazon-bedrock/openai.gpt-5.6-sol:max", cooldown_ms: 0, pass_debounce_ms: 0,
+      })) : readFile(path, "utf8"),
+    })
+    await mkdir(harness.directory, { recursive: true })
+    await promisify(execFile)("git", ["-C", harness.directory, "init", "--quiet"])
+    await writeFile(join(harness.directory, "module.ts"), "export const value = 1\n")
+    await writeFile(join(harness.directory, "WATCHDOG.yml"),
+      'advisors:\n  - name: Reviewer\n    when:\n      edits: ["**/*.ts"]\n')
+    const messages = [userTranscriptMessage(ROOT_SENTINEL)]
+    const fake = new FakeClient()
+    const client = { ...fake, session: { ...fake.session, messages: async () => ({
+      data: messages, error: undefined, response: new Response(null, { status: 200 }),
+    }) } }
+    const hooks = await plugin.createAdvisorHooks({ client, directory: harness.directory }, harness.dependencies)
+    const edit = async (id: string) => {
+      const info: AssistantMessage = { ...advisorResponse().info, id, sessionID: ROOT_ID, mode: "build",
+        parentID: "root-user-message", path: { cwd: harness.directory, root: harness.directory } }
+      const part: Part = { id, messageID: id, sessionID: ROOT_ID, type: "tool", callID: id, tool: "edit",
+        state: { status: "completed", input: { filePath: join(harness.directory, "module.ts") },
+          output: "", title: "Edit", metadata: {}, time: { start: NOW, end: NOW + 1 } } }
+      messages.push({ info, parts: [part] })
+      await hooks.event?.({ event: { type: "message.part.updated", properties: { part } } })
+      await hooks.event?.({ event: { type: "message.updated", properties: { info } } })
+      await hooks.event?.({ event: sessionIdle() })
+    }
+    try {
+      await hooks.event?.({ event: sessionCreated(harness.directory) })
+      await edit("first-edit")
+      await until(() => fake.promptCalls.length === 1)
+      await edit("noop-edit")
+      await until(() => fake.promptCalls.length > 1 ||
+        harness.logs.some(({ fields }) => fields["reason"] === "unchanged_content"))
+      expect(fake.promptCalls).toHaveLength(1)
+      await writeFile(join(harness.directory, "module.ts"), "export const value = 2\n")
+      await edit("next-edit")
+      await until(() => fake.promptCalls.length === 2)
+      expect(fake.promptCalls).toHaveLength(2)
+    } finally {
+      await hooks.event?.({ event: { type: "server.instance.disposed", properties: { directory: harness.directory } } })
+      await removeHarness(harness.temporaryRoot)
+    }
+  })
+
   test.each(["journal", "usage", "notes"])("shutdown closes the remaining owners when %s cleanup fails", async (failing) => {
     const plugin = await loadPlugin()
     if (plugin === undefined) throw new Error("Plugin module missing")

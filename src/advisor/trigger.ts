@@ -23,6 +23,27 @@ function editedPaths(part: ToolPart): string[] {
   })
 }
 
+/** Missing paths leave the content scope unknown, so deduplication must decline. */
+export function editedFiles(delta: readonly TranscriptMessage[]): string[] | undefined {
+  const files: string[] = []
+  for (const message of delta) {
+    if (isDeliveryMessage(message.info)) continue
+    for (const part of message.parts) {
+      if (!isCompletedTool(part) || !PATH_TOOLS.has(part.tool)) continue
+      const paths = editedPaths(part)
+      if (paths.length === 0) return undefined
+      files.push(...paths)
+    }
+  }
+  return files
+}
+
+export function canDeduplicateContent(when: ReviewTrigger | undefined, delta: readonly TranscriptMessage[]): boolean {
+  return when !== undefined && !delta.some((message) =>
+    !isDeliveryMessage(message.info) &&
+    message.parts.some((part) => isCompletedTool(part) && when.tools.includes(part.tool)))
+}
+
 function pathMatches(path: string, globs: readonly string[], directory: string): boolean {
   const absolute = resolve(directory, path)
   const rel = relative(directory, absolute)
