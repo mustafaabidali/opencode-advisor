@@ -85,13 +85,28 @@ if (command === "--version") {
     )
     console.log(["time | severity | model display | note", ...rows].join("\n"))
   }
-} else if (command === undefined || (command === "--note" && process.argv[3] !== undefined)) {
+} else if (command === "--note" && process.argv[3] !== undefined) {
   const noteID = process.argv[3]
+  try {
+    const result = await store.readForDelivery(cwd, noteID, config.pending_ttl_ms)
+    if (result.status === "ready") {
+      await store.claimPending(cwd, { ttlMs: config.pending_ttl_ms, noteID })
+      console.log(renderCard(result.note))
+    }
+    else {
+      console.log(`Advisor · ${result.status} note ${noteID}`)
+      process.exitCode = result.status === "expired" ? 3 : 4
+    }
+  } catch (error) {
+    await log.error({ msg: "unable to render note", noteID, error })
+    console.error("Advisor · unable to render note; see advisor log")
+    process.exitCode = 1
+  }
+} else if (command === undefined) {
   let notes: Note[] = []
   try {
     notes = await store.claimPending(cwd, {
       ttlMs: config.pending_ttl_ms,
-      ...(noteID === undefined ? {} : { noteID }),
     })
   } catch (error) {
     // no-excuse-ok: catch - this command runs inside chat and must always exit successfully.

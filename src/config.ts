@@ -11,6 +11,8 @@ export type AdvisorConfig = Readonly<{
   default_model?: string
   default_fallback?: string
   min_severity: AdvisorSeverity
+  chat_min_severity: AdvisorSeverity
+  inject_min_severity: AdvisorSeverity
   toast: boolean
   abort_on_blocker: boolean
   fallback_on_content_filter: boolean
@@ -39,7 +41,9 @@ export type LoadConfigOptions = Readonly<{
 export const DEFAULTS = {
   enabled: true,
   min_severity: "nit",
-  toast: true,
+  chat_min_severity: "blocker",
+  inject_min_severity: "concern",
+  toast: false,
   abort_on_blocker: false,
   fallback_on_content_filter: true,
   fallback_cooldown_ms: 300000,
@@ -123,8 +127,10 @@ function applyValue(
       if (typeof value !== "string") break
       return { ...config, [key]: value }
     case "min_severity":
+    case "chat_min_severity":
+    case "inject_min_severity":
       if (!isSeverity(value)) break
-      return { ...config, min_severity: value }
+      return { ...config, [key]: value }
     case "fallback_cooldown_ms":
     case "pass_debounce_ms":
     case "cooldown_ms":

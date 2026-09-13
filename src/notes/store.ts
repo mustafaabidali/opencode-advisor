@@ -1,112 +1,174 @@
-import { createHash } from "node:crypto"
 import {
   appendFile,
   mkdir,
   readFile,
   readdir,
-  rename,
   rm,
-  writeFile,
 } from "node:fs/promises"
-import { dirname, join, parse } from "node:path"
+import { join, parse } from "node:path"
 
-import { redact } from "../log"
+import { redact, type Logger } from "../log"
 import {
   isMissingFile,
   parseNote,
-  parsePendingPointer,
   parseStateSnapshot,
-  type PendingPointer,
 } from "./parse"
+import { PendingQueue } from "./pending"
+import { cwdKey, cwdParents } from "./paths"
+import { FindingStore } from "./findings"
+import { atomicWrite } from "./files"
+import { DatabaseUnavailableError } from "./database-client"
+import { deliveredFindingIDs } from "./delivery"
+import { decideAdvice, findingIdentity, issueIdentity } from "../policy"
 import type {
   Note,
+  DeliveryNote,
+  Finding,
+  FindingQuery,
+  DispositionInput,
+  TaskSnapshot,
   NoteInput,
   NoteStoreOptions,
   StateSnapshot,
   TranscriptRecord,
 } from "./types"
 
-type LocatedPointer = Readonly<{
-  key: string
-  name: string
-  pointer: PendingPointer
-}>
-
 export class NoteStore {
   readonly #dataDir: string
-  readonly #log: NoteStoreOptions["log"]
   readonly #clock: () => Date
   readonly #random: () => number
+  readonly #pending: PendingQueue
+  readonly #findings: FindingStore
+  readonly #log: Logger
+  #closed = false
 
   constructor(options: NoteStoreOptions) {
     this.#dataDir = options.dataDir
     this.#log = options.log
     this.#clock = options.clock ?? (() => new Date())
     this.#random = options.random ?? Math.random
+    this.#findings = new FindingStore(options.dataDir)
+    this.#pending = new PendingQueue({
+      dataDir: options.dataDir,
+      log: options.log,
+      readNote: (id) => this.#readNote(id),
+      readForDelivery: (note, ttlMs) => this.readForDelivery(note.cwd, note.id, ttlMs),
+    })
   }
 
   async writeNote(input: NoteInput): Promise<Note> {
+    if (this.#closed) throw new Error("Note store closed")
     const time = this.#clock().toISOString()
     const stamp = time.slice(0, 19).replaceAll("-", "").replace("T", "-").replaceAll(":", "")
     const suffix = Math.floor(this.#random() * 0x1000000)
       .toString(16)
       .padStart(6, "0")
       .slice(-6)
-    const note: Note = {
+    const safeInput: NoteInput = {
       ...input,
       reasoning: redact(input.reasoning),
       note: redact(input.note),
+      evidence: input.evidence.map(redact),
+      ...(input.failure === undefined ? {} : { failure: redact(input.failure) }),
+      ...(input.location === undefined ? {} : { location: redact(input.location) }),
+    }
+    const note: Note = {
+      ...safeInput,
       id: `${stamp}-${suffix}`,
       time,
+      finding_id: findingIdentity(safeInput),
+      issue_id: issueIdentity(safeInput),
     }
     const directory = join(this.#dataDir, "notes")
     await mkdir(directory, { recursive: true })
-    await writeFile(join(directory, `${note.id}.json`), JSON.stringify(note), "utf8")
+    const path = join(directory, `${note.id}.json`)
+    await atomicWrite(path, JSON.stringify(note))
+    try {
+      await this.#findings.record(note)
+    } catch (error) {
+      if (!(error instanceof DatabaseUnavailableError)) await rm(path, { force: true })
+      throw error
+    }
     return note
   }
 
+  async listFindings(cwd: string, rootSession?: string, query?: FindingQuery): Promise<Finding[]> {
+    return this.#findings.list(cwd, rootSession, query)
+  }
+
+  deliveredFindingIDs(findings: readonly Finding[]): Promise<ReadonlySet<string>> {
+    return deliveredFindingIDs(findings, (id) => this.#readNote(id))
+  }
+
+  close(): Promise<void> {
+    this.#closed = true
+    return this.#findings.close()
+  }
+
+  async readNotes(cwd: string, rootSession: string, ids: readonly string[]): Promise<Note[]> {
+    const notes = await Promise.all(ids.map((id) => this.#readNote(id)))
+    return notes.filter((note): note is Note =>
+      note !== undefined && note.cwd === cwd && note.root_session === rootSession)
+  }
+
+  async recordDispositions(cwd: string, rootSession: string, changes: readonly DispositionInput[]): Promise<void> {
+    await this.#findings.recordDispositions(cwd, rootSession, changes, this.#clock().toISOString())
+  }
+
+  async readTask(cwd: string, rootSession: string): Promise<TaskSnapshot | undefined> {
+    return this.#findings.readTask(cwd, rootSession)
+  }
+
+  async writeTask(cwd: string, rootSession: string, context: TaskSnapshot): Promise<void> {
+    await this.#findings.writeTask(cwd, rootSession, context)
+  }
+
   async enqueuePending(cwd: string, noteIDs: readonly string[]): Promise<void> {
-    const key = this.#cwdKey(cwd)
-    const directory = join(this.#dataDir, "pending", key)
-    await mkdir(directory, { recursive: true })
-    for (const noteID of noteIDs) {
-      const note = await this.#readNote(noteID)
-      if (note === undefined) continue
-      await writeFile(
-        join(directory, `${noteID}.json`),
-        JSON.stringify({ noteID, time: note.time } satisfies PendingPointer),
-        "utf8",
-      )
-    }
+    await this.#pending.enqueue(cwd, noteIDs)
   }
 
   async claimPending(
     cwd: string,
     options: Readonly<{ ttlMs: number; noteID?: string }>,
   ): Promise<Note[]> {
-    for (const candidate of this.#cwdParents(cwd)) {
-      const claimed = await this.#claimKey(this.#cwdKey(candidate), options)
-      if (claimed.length > 0) return claimed
-    }
-    const newest = await this.#newestPendingKey()
-    return newest === undefined ? [] : this.#claimKey(newest, options)
+    return this.#pending.claim(cwd, options)
   }
 
   async removePending(cwd: string, noteIDs: readonly string[]): Promise<void> {
-    const directory = join(this.#dataDir, "pending", this.#cwdKey(cwd))
-    await Promise.all(noteIDs.map((id) => rm(join(directory, `${id}.json`), { force: true })))
+    await this.#pending.remove(cwd, noteIDs)
+  }
+
+  async readForDelivery(cwd: string, noteID: string, ttlMs: number): Promise<DeliveryNote> {
+    const note = await this.#readNote(noteID)
+    if (note === undefined || !cwdParents(cwd).includes(note.cwd)) return { status: "missing" }
+    if (note.delivered_at !== undefined) return { status: "delivered" }
+    if (note.expired_at !== undefined) return { status: "expired" }
+    const finding = note.finding_id === undefined ? undefined :
+      (await this.listFindings(note.cwd, note.root_session, { ids: [note.finding_id] })).find((entry) => entry.id === note.finding_id)
+    if (decideAdvice(note, finding).attention === "none") return { status: "inactive" }
+    if (finding !== undefined && (await this.deliveredFindingIDs([finding])).has(finding.id)) return { status: "duplicate" }
+    const age = this.#clock().getTime() - Date.parse(note.time)
+    if (!Number.isFinite(age) || age > ttlMs) {
+      await atomicWrite(
+        join(this.#dataDir, "notes", `${note.id}.json`),
+        JSON.stringify({ ...note, expired_at: this.#clock().toISOString() } satisfies Note),
+      )
+      await this.removePending(note.cwd, [note.id])
+      return { status: "expired" }
+    }
+    return { status: "ready", note }
   }
 
   async markDelivered(noteIDs: readonly string[], at: string): Promise<void> {
     await Promise.all(
       noteIDs.map(async (noteID) => {
         const note = await this.#readNote(noteID)
-        if (note === undefined) return
-        await writeFile(
+        if (note === undefined || note.delivered_at !== undefined || note.expired_at !== undefined) return
+        await atomicWrite(
           join(this.#dataDir, "notes", `${noteID}.json`),
           JSON.stringify({ ...note, delivered_at: at } satisfies Note),
-          "utf8",
         )
+        await this.removePending(note.cwd, [note.id])
       }),
     )
   }
@@ -120,13 +182,13 @@ export class NoteStore {
   async writeState(cwd: string, snapshot: StateSnapshot): Promise<void> {
     const directory = join(this.#dataDir, "state")
     await mkdir(directory, { recursive: true })
-    await writeFile(join(directory, `${this.#cwdKey(cwd)}.json`), JSON.stringify(snapshot), "utf8")
+    await atomicWrite(join(directory, `${cwdKey(cwd)}.json`), JSON.stringify(snapshot))
   }
 
   async readState(cwd: string): Promise<StateSnapshot | undefined> {
     try {
       return parseStateSnapshot(
-        await readFile(join(this.#dataDir, "state", `${this.#cwdKey(cwd)}.json`), "utf8"),
+        await readFile(join(this.#dataDir, "state", `${cwdKey(cwd)}.json`), "utf8"),
       )
     } catch (error) {
       if (isMissingFile(error)) return undefined
@@ -152,99 +214,20 @@ export class NoteStore {
       .slice(0, options.last)
   }
 
-  async #claimKey(
-    key: string,
-    options: Readonly<{ ttlMs: number; noteID?: string }>,
-  ): Promise<Note[]> {
-    const pointers = (await this.#readPointers(key)).filter(
-      (located) => options.noteID === undefined || located.pointer.noteID === options.noteID,
-    )
-    const claimed: Note[] = []
-    for (const located of pointers.sort((a, b) => a.pointer.time.localeCompare(b.pointer.time))) {
-      const source = join(this.#dataDir, "pending", key, located.name)
-      if (this.#clock().getTime() - Date.parse(located.pointer.time) > options.ttlMs) {
-        await rm(source, { force: true })
-        await this.#log.warn({
-          msg: "discarding stale pending pointer",
-          noteID: located.pointer.noteID,
-          cwdKey: key,
-        })
-        continue
-      }
-      const claimedDirectory = join(this.#dataDir, "claimed", key)
-      await mkdir(claimedDirectory, { recursive: true })
-      try {
-        await rename(source, join(claimedDirectory, located.name))
-      } catch (error) {
-        if (isMissingFile(error)) continue
-        throw error
-      }
-      const note = await this.#readNote(located.pointer.noteID)
-      if (note !== undefined) claimed.push(note)
-    }
-    return claimed
-  }
-
-  async #readPointers(key: string): Promise<LocatedPointer[]> {
-    const directory = join(this.#dataDir, "pending", key)
-    let names: string[]
-    try {
-      names = await readdir(directory)
-    } catch (error) {
-      if (isMissingFile(error)) return []
-      throw error
-    }
-    const pointers: LocatedPointer[] = []
-    for (const name of names.filter((entry) => entry.endsWith(".json"))) {
-      const path = join(directory, name)
-      try {
-        const pointer = parsePendingPointer(await readFile(path, "utf8"))
-        if (pointer === undefined) throw new SyntaxError("invalid pending pointer")
-        pointers.push({ key, name, pointer })
-      } catch (error) {
-        if (!(error instanceof SyntaxError)) throw error
-        await rm(path, { force: true })
-        await this.#log.warn({ msg: "discarding corrupt pending pointer", path })
-      }
-    }
-    return pointers
-  }
-
-  async #newestPendingKey(): Promise<string | undefined> {
-    let keys: string[]
-    try {
-      keys = await readdir(join(this.#dataDir, "pending"))
-    } catch (error) {
-      if (isMissingFile(error)) return undefined
-      throw error
-    }
-    const groups = await Promise.all(keys.map((key) => this.#readPointers(key)))
-    return groups
-      .flat()
-      .sort((left, right) => right.pointer.time.localeCompare(left.pointer.time))[0]?.key
-  }
-
   async #readNote(noteID: string): Promise<Note | undefined> {
+    if (!/^[a-zA-Z0-9_-]+$/.test(noteID)) return undefined
     try {
-      return parseNote(await readFile(join(this.#dataDir, "notes", `${noteID}.json`), "utf8"))
+      const note = parseNote(await readFile(join(this.#dataDir, "notes", `${noteID}.json`), "utf8"))
+      if (note === undefined) await this.#log.warn({ msg: "advisor note corrupt", noteID })
+      return note
     } catch (error) {
       if (isMissingFile(error)) return undefined
+      if (error instanceof SyntaxError) {
+        await this.#log.warn({ msg: "advisor note corrupt", noteID, error })
+        return undefined
+      }
       throw error
     }
   }
 
-  #cwdKey(cwd: string): string {
-    return createHash("sha1").update(cwd).digest("hex")
-  }
-
-  #cwdParents(cwd: string): readonly string[] {
-    const parents: string[] = []
-    let current = cwd
-    while (true) {
-      parents.push(current)
-      const parent = dirname(current)
-      if (parent === current) return parents
-      current = parent
-    }
-  }
 }

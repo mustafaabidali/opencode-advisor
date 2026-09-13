@@ -2,6 +2,63 @@ import type { Logger } from "../log"
 
 export type NoteSeverity = "nit" | "concern" | "blocker"
 
+export type ReviewContext = Readonly<{
+  task_id: string
+  revision: string
+  user_message_id?: string
+}>
+export type TaskSnapshot = ReviewContext & Readonly<{ stopped: boolean; next_action?: string }>
+
+export type FindingState = "open" | "resolved" | "dismissed" | "deferred"
+export type FindingQuery =
+  | Readonly<{ ids: readonly string[] }>
+  | Readonly<{ checkpoint: Readonly<{ task_id?: string; stopped?: boolean }>; updated_ids: readonly string[] }>
+export type FindingVerification = Readonly<{
+  revision: string
+  evidence: readonly string[]
+  in_scope: boolean
+  affected_action?: string
+  cost_if_delayed?: string
+}>
+export type FindingDisposition = Readonly<{
+  state: FindingState
+  reason: string
+  reviewed_revision: string
+  evidence: readonly string[]
+  time: string
+}>
+export type DispositionInput = Readonly<{
+  id: string
+  state: FindingState
+  reviewed_revision: string
+  version: number
+  reason: string
+  evidence?: readonly string[]
+  verification?: Omit<FindingVerification, "evidence">
+}>
+export type FindingSource = Readonly<{
+  note_id: string
+  advisor_slug: string
+  model: string
+  time: string
+  reviewed_revision: string
+}>
+export type Finding = Readonly<{
+  id: string
+  issue_id: string
+  cwd: string
+  root_session: string
+  task_id: string
+  reviewed_revision: string
+  version: number
+  state: FindingState
+  updated_at: string
+  provenance: readonly FindingSource[]
+  disposition?: FindingDisposition
+  verification?: FindingVerification
+  reopened_at?: string
+}>
+
 export type NoteInput = Readonly<{
   cwd: string
   root_session: string
@@ -18,6 +75,9 @@ export type NoteInput = Readonly<{
   evidence: readonly string[]
   is_fallback: boolean
   quarantined: boolean
+  review?: ReviewContext
+  failure?: string
+  location?: string
 }>
 
 export type Note = NoteInput &
@@ -25,7 +85,14 @@ export type Note = NoteInput &
     id: string
     time: string
     delivered_at?: string
+    expired_at?: string
+    finding_id?: string
+    issue_id?: string
   }>
+
+export type DeliveryNote =
+  | Readonly<{ status: "ready"; note: Note }>
+  | Readonly<{ status: "missing" | "expired" | "delivered" | "inactive" | "duplicate" }>
 
 export type TranscriptOutcome =
   | "ok"
@@ -99,13 +166,16 @@ export type NoteStoreOptions = Readonly<{
   random?: () => number
 }>
 
+const SEVERITY_GLYPH: Readonly<Record<NoteSeverity, string>> = { blocker: "◉", concern: "◎", nit: "○" }
+
 export function renderCard(note: Note): string {
   const suffix = note.is_fallback ? " · fallback" : ""
   const lines = [
-    `Advisor · ${note.model_display} (${note.variant}) · ${note.severity}${suffix}`,
+    `${SEVERITY_GLYPH[note.severity]} Advisor · ${note.model_display} (${note.variant}) · ${note.severity}${suffix}`,
     `reasoning: ${note.reasoning}`,
     `note: ${note.note}`,
   ]
   if (note.evidence.length > 0) lines.push(`evidence: ${note.evidence.join(", ")}`)
+  lines.push(`finding: ${note.id}`)
   return lines.join("\n")
 }

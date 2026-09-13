@@ -8,6 +8,25 @@ import {
   type Severity,
 } from "../src/advice"
 
+test("keeps the underlying failure and location separate from a proposed fix", () => {
+  const result = parseAdvice(`<advice severity="concern">
+reasoning: Exit zero is not proof of the requested output
+note: Validate an idempotent receipt for the requested note
+failure: HTTP success is treated as successful rendering
+location: src/deliver/cards.ts:156
+evidence: the unrelated-stdout regression fails
+</advice>`)
+
+  expect(result.notes[0]).toEqual({
+    severity: "concern",
+    reasoning: "Exit zero is not proof of the requested output",
+    note: "Validate an idempotent receipt for the requested note",
+    failure: "HTTP success is treated as successful rendering",
+    location: "src/deliver/cards.ts:156",
+    evidence: ["the unrelated-stdout regression fails"],
+  })
+})
+
 describe("parseAdvice", () => {
   test("treats the <silent/> sentinel as zero notes without warnings", () => {
     // Given / When / Then

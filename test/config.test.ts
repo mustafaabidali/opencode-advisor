@@ -61,7 +61,9 @@ describe("DEFAULTS", () => {
     expect(DEFAULTS).toEqual({
       enabled: true,
       min_severity: "nit",
-      toast: true,
+      chat_min_severity: "blocker",
+      inject_min_severity: "concern",
+      toast: false,
       abort_on_blocker: false,
       fallback_on_content_filter: true,
       fallback_cooldown_ms: 300000,
@@ -192,8 +194,29 @@ describe("loadConfig", () => {
     const result = await load(files)
 
     // Then
-    expect(result.config.toast).toBe(true)
+    expect(result.config.toast).toBe(false)
     expect(result.warnings).toEqual([expect.stringContaining("toast")])
+  })
+
+  test("accepts a severity for chat_min_severity and inject_min_severity and rejects other strings", async () => {
+    // Given
+    const accepted = { [PROJECT_PATH]: JSON.stringify({ chat_min_severity: "blocker", inject_min_severity: "concern" }) }
+    const rejected = { [PROJECT_PATH]: JSON.stringify({ chat_min_severity: "loud", inject_min_severity: "quiet" }) }
+
+    // When
+    const good = await load(accepted)
+    const bad = await load(rejected)
+
+    // Then
+    expect(good.config.chat_min_severity).toBe("blocker")
+    expect(good.config.inject_min_severity).toBe("concern")
+    expect(good.warnings).toEqual([])
+    expect(bad.config.chat_min_severity).toBe("blocker")
+    expect(bad.config.inject_min_severity).toBe("concern")
+    expect(bad.warnings).toEqual([
+      expect.stringContaining("chat_min_severity"),
+      expect.stringContaining("inject_min_severity"),
+    ])
   })
 
   test("validates object values and string-array elements per key", async () => {

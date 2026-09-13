@@ -1,10 +1,9 @@
-import { join } from "node:path"
 import type { Config, Message, Part } from "@opencode-ai/sdk"
 import type { AdvisorConfig } from "../config"
 import { renderDelta, sliceDelta, type Cursor, type TranscriptMessage } from "../delta"
 import { redact, type Logger } from "../log"
-import { displayLevel, displayName, type CooldownRegistry, type ModelCatalog } from "../models"
-import type { NoteStore, StateSnapshot, TranscriptOutcome } from "../notes"
+import type { CooldownRegistry, ModelCatalog } from "../models"
+import type { NoteStore, ReviewContext, StateSnapshot } from "../notes"
 import { ADVISOR_SYSTEM_PROMPT, buildPassPrompt } from "../prompts"
 import {
   DELIVERY_AGENT_ID,
@@ -23,6 +22,9 @@ import {
   type PromptCall,
   type PromptResponse,
 } from "./pass"
+import { buildSnapshot, type AdvisorStats } from "./snapshot"
+import { shouldReview } from "./trigger"
+import { readProjectFiles } from "./files"
 export type ResolvedEntry = AdvisorEntry & Readonly<{ rosterInstructions?: string; watchdogMd?: string }>; type MessageResponse = readonly Readonly<{ info: Message; parts: readonly Part[] }>[]
 export type AdvisorClient = Readonly<{
   session: Readonly<{
@@ -37,12 +39,15 @@ export type AdvisorRuntimeOptions = Readonly<{
   log: Logger; client: AdvisorClient
   directory: string; clock: () => number; timers: AdvisorTimers
   readFile: (path: string) => Promise<string>; onAdvisorSession: (id: string) => void; onWarning: (advisorSlug: string, message: string) => void | Promise<void>
+  captureReview?: (sessionID: string, messages: readonly TranscriptMessage[]) => Promise<ReviewContext>
 }>
-export type RunPassContext = Readonly<{ firstUserText?: string }>
-type AdvisorStats = { passes: number; notes: number; cost: number; lastPassAt: string; lastOutcome: TranscriptOutcome }
+export type RunPassContext = Readonly<{
+  firstUserText?: string
+  onResult?: (result: PassResult) => void | Promise<void>
+}>
 const EMPTY_CURSOR = {} as const satisfies Cursor
 export class AdvisorRuntime {
-  readonly #sessions = new Map<string, string>(); readonly #cursors = new Map<string, Cursor>()
+  readonly #sessions = new Map<string, string>(); readonly #cursors = new Map<string, Cursor>(); readonly #primed = new Set<string>()
   readonly #inFlight = new Set<string>(); readonly #warnedNoModel = new Set<string>()
   readonly #watched = new Set<string>(); readonly #stats = new Map<string, AdvisorStats>(); #catalogPromise?: Promise<ModelCatalog>; constructor(private readonly options: AdvisorRuntimeOptions) {}
   async registerAgents(cfg: Config): Promise<void> {
@@ -91,13 +96,21 @@ export class AdvisorRuntime {
       return []
     }
     this.#watched.add(watchedID)
+    const review = await this.options.captureReview?.(watchedID, messages)
     const catalog = await this.#catalog()
-    const files = await this.#projectFiles()
+    const files = await readProjectFiles(this.options.directory, this.options.readFile, this.options.log)
     const originalRequest = context.firstUserText ?? this.#firstUserText(messages)
     const latestRequest = this.#latestUserText(messages)
     const settled = await Promise.allSettled(
-      this.options.roster.filter(({ enabled }) => enabled).map((entry) =>
-        this.#runEntry(watchedID, entry, messages, originalRequest, latestRequest, catalog, files)),
+      this.options.roster.filter(({ enabled }) => enabled).map(async (entry) => {
+        const result = await this.#runEntry(watchedID, entry, messages, originalRequest, latestRequest, catalog, files, review)
+        if (result !== undefined) {
+          try { await context.onResult?.(result) } catch (error) {
+            await this.options.log.warn({ msg: "advisor result delivery failed", watchedID, advisor: entry.slug, error })
+          }
+        }
+        return result
+      }),
     )
     const results: PassResult[] = []
     for (const result of settled) {
@@ -112,36 +125,42 @@ export class AdvisorRuntime {
   }
   async #runEntry(watchedID: string, entry: ResolvedEntry, messages: MessageResponse,
     originalRequest: string, latestRequest: string | undefined, catalog: ModelCatalog,
-    files: Readonly<{ agentsMd?: string; contextMd?: string }>): Promise<PassResult | undefined> {
+    files: Readonly<{ agentsMd?: string; contextMd?: string }>, review?: ReviewContext): Promise<PassResult | undefined> {
     const key = this.#key(watchedID, entry.slug)
     if (this.#inFlight.has(key)) return undefined
     const sliced = sliceDelta(messages satisfies readonly TranscriptMessage[], this.#cursors.get(key) ?? EMPTY_CURSOR)
+    if (sliced.delta.length > 0 && !shouldReview(entry.when, sliced.delta, this.options.directory)) {
+      await this.options.log.info({ msg: "advisor pass skipped", watchedID, advisor: entry.slug, reason: "no_trigger" })
+      return undefined
+    }
     const delta = renderDelta(sliced.delta, { maxChars: this.options.config.max_delta_chars, redact })
     const stats = this.#stats.get(entry.slug)
-    const prompt = buildPassPrompt({
+    const promptInput = {
       originalRequest,
       ...(latestRequest === undefined ? {} : { latestRequest }),
       delta,
       passIndex: (stats?.passes ?? 0) + 1,
-      isFirstPass: stats === undefined,
       ...(entry.rosterInstructions === undefined ? {} : { rosterInstructions: entry.rosterInstructions }),
       ...(entry.watchdogMd === undefined ? {} : { watchdogMd: entry.watchdogMd }),
       ...(entry.instructions === undefined ? {} : { entryInstructions: entry.instructions }),
       ...files,
-    })
-    if (prompt === null) return undefined
+    }
+    const primingPrompt = buildPassPrompt({ ...promptInput, isFirstPass: true })
+    const continuationPrompt = buildPassPrompt({ ...promptInput, isFirstPass: false })
+    if (primingPrompt === null || continuationPrompt === null) return undefined
     this.#inFlight.add(key)
     try {
       const advisorSession = await this.ensureSession(watchedID, entry)
       let passCost = 0
       const store = this.options.store
+      const prompted = new Set<string>()
       const result = await executeAdvisorPass({
         config: this.options.config,
         entry,
         catalog,
         cooldowns: this.options.cooldowns,
         store: {
-          writeNote: (note) => store.writeNote(note),
+          writeNote: (note) => store.writeNote({ ...note, ...(review === undefined ? {} : { review }) }),
           appendTranscript: async (root, record) => { passCost += record.cost; await store.appendTranscript(root, record) },
           writeState: (cwd, snapshot) => store.writeState(cwd, snapshot) },
         log: this.options.log,
@@ -152,7 +171,7 @@ export class AdvisorRuntime {
         directory: this.options.directory,
         watchedID,
         advisorSession,
-        prompt,
+        prompt: (sessionID) => { prompted.add(sessionID); return this.#primed.has(sessionID) ? continuationPrompt : primingPrompt },
         clock: this.options.clock,
         timers: this.options.timers,
         refreshSession: async () => {
@@ -164,6 +183,7 @@ export class AdvisorRuntime {
       if (["ok", "silent", "fallback", "quarantined"].includes(result.outcome)) {
         this.#cursors.set(key, sliced.next)
         this.#warnedNoModel.delete(key)
+        for (const sessionID of prompted) this.#primed.add(sessionID)
       }
       this.#recordStats(entry.slug, result, passCost)
       return result
@@ -194,21 +214,6 @@ export class AdvisorRuntime {
     this.#catalogPromise ??= this.options.catalog()
     return this.#catalogPromise
   }
-  async #projectFiles(): Promise<Readonly<{ agentsMd?: string; contextMd?: string }>> {
-    const read = async (name: string): Promise<string | undefined> => {
-      try {
-        return await this.options.readFile(join(this.options.directory, name))
-      } catch (error) {
-        await this.options.log.debug({ msg: "advisor context file unavailable", name, error })
-        return undefined
-      }
-    }
-    const [agentsMd, contextMd] = await Promise.all([read("AGENTS.md"), read("CONTEXT.md")])
-    return {
-      ...(agentsMd === undefined ? {} : { agentsMd }),
-      ...(contextMd === undefined ? {} : { contextMd }),
-    }
-  }
   #firstUserText(messages: MessageResponse): string {
     const first = messages.find(({ info }) => info.role === "user"); return first?.parts.filter((part) => part.type === "text").map((part) => part.text).join("\n") ?? ""
   }
@@ -216,30 +221,7 @@ export class AdvisorRuntime {
     const latest = messages.findLast(({ info }) => info.role === "user" && info.agent !== DELIVERY_AGENT_ID && !info.id.startsWith("adv_")); return latest?.parts.filter((part) => part.type === "text").map((part) => part.text).join("\n")
   }
   #snapshot(catalog: ModelCatalog): StateSnapshot {
-    return {
-      advisors: this.options.roster.map((entry) => {
-        const stats = this.#stats.get(entry.slug)
-        const cooledUntil = this.options.cooldowns.cooledUntil(entry.model.long)
-        return {
-          slug: entry.slug,
-          roster_name: entry.name,
-          model: entry.model.long,
-          model_display: displayName(entry.model, catalog),
-          variant: displayLevel(entry.model) ?? "default",
-          ...(entry.fallback === undefined ? {} : { fallback: entry.fallback.long }),
-          tools: entry.tools,
-          enabled: entry.enabled,
-          ...(cooledUntil === undefined ? {} : { cooled_until: new Date(cooledUntil).toISOString() }),
-          passes: stats?.passes ?? 0,
-          notes: stats?.notes ?? 0,
-          cost: stats?.cost ?? 0,
-          last_pass_at: stats?.lastPassAt ?? new Date(this.options.clock()).toISOString(),
-          last_outcome: stats?.lastOutcome ?? "silent",
-        }
-      }),
-      watched_sessions: [...this.#watched],
-      updated_at: new Date(this.options.clock()).toISOString(),
-    }
+    return buildSnapshot({ roster: this.options.roster, stats: this.#stats, cooldowns: this.options.cooldowns, catalog, watched: this.#watched, now: this.options.clock() })
   }
   #key(watchedID: string, slug: string): string {
     return `${watchedID}\u0000${slug}`

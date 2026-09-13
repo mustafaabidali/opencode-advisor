@@ -78,7 +78,7 @@ export type ExecutePassInput = Readonly<{
   directory: string
   watchedID: string
   advisorSession: string
-  prompt: string
+  prompt: (sessionID: string) => string
   clock: () => number
   timers: AdvisorTimers
   refreshSession: () => Promise<string>
@@ -111,7 +111,7 @@ async function attempt({ input, sessionID, model, agent }: AttemptInput): Promis
       body: {
         agent,
         model: { providerID: model.providerID, modelID: model.modelID },
-        parts: [{ type: "text", text: input.prompt }],
+        parts: [{ type: "text", text: input.prompt(sessionID) }],
       },
     })
     const raced = await Promise.race([request, timeout])
@@ -170,6 +170,8 @@ async function writeSuccessfulNotes({ input, sessionID, model, isFallback, parts
       reasoning: advice.reasoning,
       note: advice.note,
       evidence: advice.evidence,
+      ...(advice.failure === undefined ? {} : { failure: advice.failure }),
+      ...(advice.location === undefined ? {} : { location: advice.location }),
       is_fallback: isFallback,
       quarantined: guard.quarantined,
     })

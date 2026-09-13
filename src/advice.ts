@@ -5,6 +5,8 @@ export type AdviceNote = {
   readonly reasoning: string
   readonly note: string
   readonly evidence: string[]
+  readonly failure?: string
+  readonly location?: string
 }
 
 export type ParseAdviceResult = {
@@ -27,7 +29,7 @@ const OPEN_ADVICE_TAG = /<advice\b[^>]*>/gi
 const CLOSE_ADVICE_TAG = /<\/advice\s*>/gi
 const ADVICE_BLOCK = /<advice\b([^>]*)>([\s\S]*?)<\/advice\s*>/gi
 const SEVERITY_ATTRIBUTE = /\bseverity\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+))/i
-const LABELLED_LINE = /^\s*(reasoning|note|evidence)\s*:\s*(.*)$/i
+const LABELLED_LINE = /^\s*(reasoning|note|evidence|failure|location)\s*:\s*(.*)$/i
 
 export function parseAdvice(text: string): ParseAdviceResult {
   const openingTags = text.match(OPEN_ADVICE_TAG)?.length ?? 0
@@ -65,12 +67,14 @@ export function parseAdvice(text: string): ParseAdviceResult {
     let reasoning = ""
     let note = body
     let evidence: string[] = []
+    let failure: string | undefined
+    let location: string | undefined
 
     if (hasNoteLabel) {
-      const reasoningLines: string[] = []
-      const noteLines: string[] = []
-      const evidenceLines: string[] = []
-      let activeLabel: "reasoning" | "note" | "evidence" | undefined
+      const fields: Record<"reasoning" | "note" | "evidence" | "failure" | "location", string[]> = {
+        reasoning: [], note: [], evidence: [], failure: [], location: [],
+      }
+      let activeLabel: keyof typeof fields | undefined
 
       for (const line of lines) {
         const labelled = line.match(LABELLED_LINE)
@@ -78,37 +82,20 @@ export function parseAdvice(text: string): ParseAdviceResult {
         const value = labelled?.[2] ?? line
         switch (label) {
           case "reasoning":
-            activeLabel = "reasoning"
-            reasoningLines.push(value)
-            break
           case "note":
-            activeLabel = "note"
-            noteLines.push(value)
-            break
           case "evidence":
-            activeLabel = "evidence"
-            evidenceLines.push(value)
-            break
-          default:
-            switch (activeLabel) {
-              case "reasoning":
-                reasoningLines.push(line)
-                break
-              case "note":
-                noteLines.push(line)
-                break
-              case "evidence":
-                evidenceLines.push(line)
-                break
-              case undefined:
-                break
-            }
+          case "failure":
+          case "location":
+            activeLabel = label
         }
+        if (activeLabel !== undefined) fields[activeLabel].push(value)
       }
 
-      reasoning = reasoningLines.join("\n").trim()
-      note = noteLines.join("\n").trim()
-      evidence = evidenceLines
+      reasoning = fields.reasoning.join("\n").trim()
+      note = fields.note.join("\n").trim()
+      failure = fields.failure.join("\n").trim() || undefined
+      location = fields.location.join("\n").trim() || undefined
+      evidence = fields.evidence
         .flatMap((line) => line.split(","))
         .map((path) => path.trim())
         .filter((path) => path.length > 0)
@@ -119,7 +106,11 @@ export function parseAdvice(text: string): ParseAdviceResult {
       continue
     }
 
-    notes.push({ severity, reasoning, note, evidence })
+    notes.push({
+      severity, reasoning, note, evidence,
+      ...(failure === undefined ? {} : { failure }),
+      ...(location === undefined ? {} : { location }),
+    })
   }
 
   return { notes, warnings }
@@ -144,4 +135,23 @@ export function severityRank(severity: Severity): number {
 
 export function meetsMinSeverity(severity: Severity, minimum: Severity): boolean {
   return severityRank(severity) >= severityRank(minimum)
+}
+
+export type SeverityFloors = Readonly<{ chat_min_severity: Severity; inject_min_severity: Severity }>
+
+export type Partitioned<T> = Readonly<{ chat: T[]; withheld: T[]; injected: T[] }>
+
+export function partitionBySeverity<T extends Readonly<{ severity: Severity; advisor_slug: string }>>(
+  notes: readonly T[],
+  floorsFor: (advisorSlug: string) => SeverityFloors,
+): Partitioned<T> {
+  const chat: T[] = []
+  const withheld: T[] = []
+  const injected: T[] = []
+  for (const note of notes) {
+    const floors = floorsFor(note.advisor_slug)
+    ;(meetsMinSeverity(note.severity, floors.chat_min_severity) ? chat : withheld).push(note)
+    if (meetsMinSeverity(note.severity, floors.inject_min_severity)) injected.push(note)
+  }
+  return { chat, withheld, injected }
 }

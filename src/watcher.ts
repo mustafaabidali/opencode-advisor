@@ -63,6 +63,12 @@ export class Watcher<Timer> {
     this.scheduler = new PassScheduler(options)
   }
 
+  dispose(): void {
+    for (const id of [...this.roots.keys(), ...this.advisedChildren.keys()]) this.forgetSession(id)
+    this.children.clear()
+    this.advisorSessions.clear()
+  }
+
   markAdvisorSession(sessionID: string): void {
     this.advisorSessions.add(sessionID)
     this.forgetSession(sessionID)

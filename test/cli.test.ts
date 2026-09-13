@@ -93,6 +93,21 @@ function runCli(project: string, xdg: string, args: readonly string[] = []) {
 }
 
 describe("advisor CLI", () => {
+  test("an explicit note can be rendered again after a pointer was claimed, until acknowledgment", async () => {
+    const { project, xdg, store } = await fixture()
+    const note = await store.writeNote(noteInput(project))
+    await store.enqueuePending(project, [note.id])
+    await store.claimPending(project, { ttlMs: 600_000, noteID: note.id })
+
+    const first = runCli(project, xdg, ["--note", note.id])
+    const retry = runCli(project, xdg, ["--note", note.id])
+
+    expect(first.exitCode).toBe(0)
+    expect(first.stdout.toString()).toBe(`${renderCard(note)}\n`)
+    expect(retry.stdout.toString()).toBe(first.stdout.toString())
+    expect((await store.listNotes(project, { last: 1 }))[0]?.delivered_at).toBeUndefined()
+  })
+
   test("prints pending cards once and reports an empty queue on the next run", async () => {
     // Given
     const { project, xdg, store } = await fixture()
@@ -146,7 +161,7 @@ describe("advisor CLI", () => {
     // Then
     expect(targeted.exitCode).toBe(0)
     expect(targeted.stdout.toString()).toBe(`${renderCard(secondNote)}\n`)
-    expect(repeat.stdout.toString()).toBe("Advisor · no pending notes\n")
+    expect(repeat.stdout.toString()).toBe(`${renderCard(secondNote)}\n`)
     expect(remaining.stdout.toString()).toBe(`${renderCard(firstNote)}\n`)
     expect(missingID.exitCode).toBe(2)
     expect(missingID.stdout.toString()).toBe("")

@@ -59,13 +59,20 @@ if [[ ! -e "$CONFIG_FILE" && ! -L "$CONFIG_FILE" ]]; then
   // entry sets one; an entry whose inherited fallback is its own model retries on default_model.
   // "default_fallback": "<provider>/<other-model-id>:<level>",
 
-  // Lowest severity delivered: "nit", "concern", or "blocker".
+  // Lowest severity kept: "nit", "concern", or "blocker". Notes below it are dropped.
   "min_severity": "nit",
 
-  // Show an OpenCode toast for each delivered note.
-  "toast": true,
+  // Lowest severity shown as a chat card. All recorded notes remain in the checkpoint inbox.
+  "chat_min_severity": "blocker",
 
-  // Opt in to aborting the watched turn when an advisor reports a blocker.
+  // Lowest severity fed to the primary's next step, silently, until it is shown as a card or
+  // note_ttl_turns pass. The primary honors user steering and compares proposals at checkpoints.
+  "inject_min_severity": "concern",
+
+  // Show an OpenCode toast for each delivered note.
+  "toast": false,
+
+  // Opt in to aborting when a before_action checkpoint finds a verified blocker for the named next action with a cost of delay.
   "abort_on_blocker": false,
 
   // Retry the same delta once on the fallback when content filtering blocks a model.
@@ -83,13 +90,13 @@ if [[ ! -e "$CONFIG_FILE" && ! -L "$CONFIG_FILE" ]]; then
   // Maximum rendered transcript-delta size sent to each advisor.
   "max_delta_chars": 30000,
 
-  // Number of later user turns for which an undelivered blocker remains injectable.
+  // Number of later user turns for which an undelivered note remains injectable.
   "note_ttl_turns": 2,
 
   // Maximum duration of one advisor pass before its child session is aborted.
   "pass_timeout_ms": 180000,
 
-  // Maximum age of a pending card pointer before it is discarded.
+  // Maximum card age before it is marked expired and its pending pointer is removed.
   "pending_ttl_ms": 600000,
 
   // Optional child-agent names to advise: true uses the roster, a string selects a model.

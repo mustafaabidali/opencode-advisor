@@ -6,6 +6,7 @@ import {
   DELIVERY_AGENT_ID,
   KNOWN_BUILTINS,
   type AdvisorEntry,
+  type AdvisorFloors,
   type KnownBuiltin,
   type NormalizedTools,
   type RosterAdvisorInput,
@@ -87,13 +88,24 @@ export function resolveEntry(
     model,
     tools,
     min_severity: input.min_severity ?? config.min_severity,
+    chat_min_severity: input.chat_min_severity ?? config.chat_min_severity,
+    inject_min_severity: input.inject_min_severity ?? config.inject_min_severity,
     slug,
     agentId,
     ...(instructions === undefined ? {} : { instructions }),
+    ...(input.when === undefined ? {} : { when: input.when }),
   }
   return fallback === undefined
     ? base
     : { ...base, fallback, fallbackAgentId: `${agentId}-fb` }
+}
+
+export function rosterFloors(roster: readonly AdvisorEntry[]): (slug: string) => AdvisorFloors | undefined {
+  const bySlug = new Map(roster.map((entry) => [
+    entry.slug,
+    { chat_min_severity: entry.chat_min_severity, inject_min_severity: entry.inject_min_severity },
+  ]))
+  return (slug) => bySlug.get(slug)
 }
 
 function toolsMap(granted: readonly KnownBuiltin[]): Record<string, boolean> {

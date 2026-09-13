@@ -65,6 +65,32 @@ function userMessage(id: string, text: string, created = 1): { info: UserMessage
   }
 }
 
+function watchedAssistant(id: string, parts: Part[], created: number): { info: AssistantMessage; parts: Part[] } {
+  return {
+    info: {
+      id,
+      sessionID: "root",
+      role: "assistant",
+      time: { created, completed: created + 1 },
+      parentID: "user-1",
+      providerID: "amazon-bedrock",
+      modelID: "openai.gpt-5.6-sol",
+      mode: "build",
+      path: { cwd: DIRECTORY, root: DIRECTORY },
+      cost: 0,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    },
+    parts,
+  }
+}
+
+function editPart(messageID: string, filePath: string): Part {
+  return {
+    id: `edit-${messageID}`, sessionID: "root", messageID, type: "tool", callID: "c", tool: "edit",
+    state: { status: "completed", input: { filePath }, output: "", title: "edit", metadata: {}, time: { start: 1, end: 2 } },
+  }
+}
+
 function assistant(text: string, overrides: Partial<AssistantMessage> = {}): {
   info: AssistantMessage
   parts: Part[]
@@ -137,7 +163,7 @@ class FakeClient implements AdvisorClient {
   readonly creates: Parameters<AdvisorClient["session"]["create"]>[0][] = []
   readonly prompts: PromptCall[] = []
   readonly aborts: Parameters<AdvisorClient["session"]["abort"]>[0][] = []
-  messages = [userMessage("user-1", "Build the feature")]
+  messages: Array<{ info: UserMessage | AssistantMessage; parts: Part[] }> = [userMessage("user-1", "Build the feature")]
   promptScripts: Array<(call: PromptCall) => Promise<ReturnTypeData>> = []
   createCount = 0
 
@@ -215,6 +241,63 @@ function runtime(options: Readonly<{
 }
 
 describe("AdvisorRuntime", () => {
+  test("emits a completed reviewer immediately and still delivers the slower reviewer's alternative", async () => {
+    const fast = Promise.withResolvers<ReturnTypeData>()
+    const slow = Promise.withResolvers<ReturnTypeData>()
+    const client = new FakeClient()
+    client.promptScripts.push(() => fast.promise, () => slow.promise)
+    const { runtime: subject } = runtime({ roster: [entry("Fast"), entry("Slow")], client })
+    const emitted: Note[] = []
+    let finished = false
+    const pass = subject.runPass("root", "idle", { onResult: (result) => { emitted.push(...result.notes) } })
+      .then((results) => { finished = true; return results })
+    const response = (note: string): ReturnTypeData => ({
+      data: assistant(`<advice severity="concern">reasoning: Reproduced a failure\nnote: ${note}\nevidence: failing regression</advice>`),
+      response: { status: 200 },
+    })
+    try {
+      await until(() => client.prompts.length === 2)
+      fast.resolve(response("Retry the failing command"))
+      await until(() => emitted.length === 1)
+      expect(finished).toBeFalse()
+      expect(emitted[0]?.advisor_slug).toBe("fast")
+      expect(client.aborts).toHaveLength(0)
+      slow.resolve(response("Use an idempotent receipt instead"))
+      expect(await pass).toHaveLength(2)
+      expect(emitted.map((note) => note.advisor_slug)).toEqual(["fast", "slow"])
+      expect(emitted[1]?.note).toContain("idempotent receipt")
+      expect(client.aborts).toHaveLength(0)
+    } finally {
+      fast.resolve(response("Retry the failing command"))
+      slow.resolve(response("Use an idempotent receipt instead"))
+      await pass
+    }
+  })
+
+  test("one result callback failure preserves both reviews and does not cancel a sibling", async () => {
+    const client = new FakeClient()
+    for (const name of ["Alpha", "Beta"]) client.promptScripts.push(async () => ({
+      data: assistant(`<advice severity="concern">note: Fix ${name}</advice>`), response: { status: 200 },
+    }))
+    const warnings: string[] = []
+    const { runtime: subject, store } = runtime({
+      roster: [entry("Alpha"), entry("Beta")], client,
+      logger: { ...log, warn: async ({ msg }) => { warnings.push(msg) } },
+    })
+    const delivered: string[] = []
+    const results = await subject.runPass("root", "idle", { onResult: (result) => {
+      const slug = result.notes[0]?.advisor_slug
+      if (slug === "alpha") throw new Error("delivery unavailable")
+      if (slug !== undefined) delivered.push(slug)
+    } })
+
+    expect(results).toHaveLength(2)
+    expect(store.notes).toHaveLength(2)
+    expect(delivered).toEqual(["beta"])
+    expect(warnings).toContain("advisor result delivery failed")
+    expect(client.aborts).toHaveLength(0)
+  })
+
   test("registers enabled primary, fallback, and delivery agents without clobbering user agents", async () => {
     // Given
     const subject = runtime().runtime
@@ -277,6 +360,58 @@ describe("AdvisorRuntime", () => {
     expect(prompt?.text).not.toContain("## Latest user request\nignore synthetic request")
   })
 
+  test("sends static context once per child session, keyed by child not by advisor", async () => {
+    // Given
+    const client = new FakeClient()
+    const promptText = (index: number): string =>
+      client.prompts[index]?.body.parts.find((part) => part.type === "text")?.text ?? ""
+    const { runtime: subject } = runtime({ client })
+
+    // When
+    await subject.runPass("root", "idle", {})
+    client.messages = [...client.messages, userMessage("user-2", "second turn", 2)]
+    await subject.runPass("root", "idle", {})
+    await subject.runPass("other-root", "idle", {})
+
+    // Then
+    expect(client.prompts.map(({ path }) => path.id)).toEqual([
+      "advisor-session-1", "advisor-session-1", "advisor-session-2",
+    ])
+    expect(promptText(0)).toContain("## AGENTS.md\nproject guidance")
+    expect(promptText(1)).not.toContain("## AGENTS.md")
+    expect(promptText(1)).toContain("## Delta")
+    expect(promptText(2)).toContain("## AGENTS.md\nproject guidance")
+  })
+
+  test("re-sends static context to a replacement child session after a poisoned-session refresh", async () => {
+    // Given
+    const client = new FakeClient()
+    const poisoned = {
+      name: "APIError" as const,
+      data: { message: "Cache point cannot be inserted after reasoning block.", statusCode: 400, isRetryable: false },
+    }
+    client.promptScripts.push(
+      async () => ({ data: assistant("<silent/>"), response: { status: 200 } }),
+      async () => ({ data: assistant("", { error: poisoned }), response: { status: 200 } }),
+      async () => ({ data: assistant("<silent/>"), response: { status: 200 } }),
+    )
+    const promptText = (index: number): string =>
+      client.prompts[index]?.body.parts.find((part) => part.type === "text")?.text ?? ""
+    const { runtime: subject } = runtime({ client })
+
+    // When
+    await subject.runPass("root", "idle", {})
+    client.messages = [...client.messages, userMessage("user-2", "second turn", 2)]
+    await subject.runPass("root", "idle", {})
+
+    // Then
+    expect(client.prompts.map(({ path }) => path.id)).toEqual([
+      "advisor-session-1", "advisor-session-1", "advisor-session-2",
+    ])
+    expect(promptText(1)).not.toContain("## AGENTS.md")
+    expect(promptText(2)).toContain("## AGENTS.md\nproject guidance")
+  })
+
   test("starts all advisors in parallel, records notes, and advances independent cursors", async () => {
     // Given
     const client = new FakeClient()
@@ -332,7 +467,7 @@ describe("AdvisorRuntime", () => {
       noteLevel: "max",
       transcriptLevel: "max",
       snapshotLevel: "max",
-      cardHeader: "Advisor · GPT-5.6 Sol (max) · concern",
+      cardHeader: "◎ Advisor · GPT-5.6 Sol (max) · concern",
     })
   })
 
@@ -603,5 +738,94 @@ describe("AdvisorRuntime", () => {
     expect(detail).toContain("[REDACTED]")
     expect(detail).not.toContain(secret)
     expect(detail).toHaveLength(600)
+  })
+})
+
+describe("AdvisorRuntime when triggers", () => {
+  function gated(name: string): AdvisorEntry {
+    return resolved({ name, when: { edits: ["**/*.ts"], commands: [], tools: [] } })
+  }
+  function promptText(client: FakeClient, index: number): string {
+    return client.prompts[index]?.body.parts.find((part) => part.type === "text")?.text ?? ""
+  }
+
+  test("skips a delta with no trigger: no child session, no prompt, no transcript, no pass counted, cursor kept", async () => {
+    // Given
+    const client = new FakeClient()
+    client.messages = [userMessage("user-1", "Build the feature", 1), watchedAssistant("a-1", [textPart("a-1", "thinking aloud")], 2)]
+    const infos: Parameters<Logger["info"]>[0][] = []
+    const { runtime: subject, store } = runtime({ roster: [gated("Oracle")], client, logger: { ...log, info: async (fields) => { infos.push(fields) } } })
+
+    // When
+    const results = await subject.runPass("root", "idle", {})
+
+    // Then
+    expect(results).toEqual([])
+    expect(client.creates).toHaveLength(0)
+    expect(client.prompts).toHaveLength(0)
+    expect(store.transcripts).toHaveLength(0)
+    expect(store.states.at(-1)?.advisors[0]?.passes).toBe(0)
+    expect(infos).toContainEqual({ msg: "advisor pass skipped", watchedID: "root", advisor: "oracle", reason: "no_trigger" })
+
+    // When
+    client.messages = [...client.messages, watchedAssistant("a-2", [editPart("a-2", `${DIRECTORY}/src/x.ts`)], 3)]
+    client.promptScripts.push(async () => ({ data: assistant("<silent/>"), response: { status: 200 } }))
+    const fired = await subject.runPass("root", "idle", {})
+
+    // Then
+    expect(fired.map(({ outcome }) => outcome)).toEqual(["silent"])
+    expect(client.prompts).toHaveLength(1)
+    expect(promptText(client, 0)).toContain("thinking aloud")
+    expect(promptText(client, 0)).toContain("src/x.ts")
+    expect(promptText(client, 0)).toContain("## AGENTS.md")
+    expect(store.states.at(-1)?.advisors[0]?.passes).toBe(1)
+  })
+
+  test("an empty delta is skipped silently, without a no_trigger log line", async () => {
+    // Given
+    const client = new FakeClient()
+    client.messages = [userMessage("user-1", "Build", 1), watchedAssistant("a-1", [editPart("a-1", `${DIRECTORY}/a.ts`)], 2)]
+    client.promptScripts.push(async () => ({ data: assistant("<silent/>"), response: { status: 200 } }))
+    const infos: Parameters<Logger["info"]>[0][] = []
+    const { runtime: subject } = runtime({ roster: [gated("Oracle")], client, logger: { ...log, info: async (fields) => { infos.push(fields) } } })
+    await subject.runPass("root", "step", {})
+
+    // When
+    await subject.runPass("root", "idle", {})
+
+    // Then
+    expect(client.prompts).toHaveLength(1)
+    expect(infos.filter((fields) => fields["msg"] === "advisor pass skipped")).toHaveLength(0)
+  })
+
+  test("a gated and an ungated entry on one step: only the ungated one runs on prose, and the gated one later sees the carried prose", async () => {
+    // Given
+    const client = new FakeClient()
+    client.messages = [userMessage("user-1", "Build", 1), watchedAssistant("a-1", [textPart("a-1", "prose step")], 2)]
+    client.promptScripts.push(async () => ({ data: assistant("<silent/>"), response: { status: 200 } }))
+    const { runtime: subject } = runtime({ roster: [gated("Oracle"), entry("Docs")], client })
+
+    // When
+    const first = await subject.runPass("root", "idle", {})
+
+    // Then
+    expect(first.map(({ slug, outcome }) => [slug, outcome])).toEqual([["docs", "silent"]])
+    expect(client.prompts.map(({ body }) => body.agent)).toEqual(["advisor-docs"])
+
+    // When
+    client.messages = [...client.messages, watchedAssistant("a-2", [editPart("a-2", `${DIRECTORY}/b.ts`)], 3)]
+    client.promptScripts.push(
+      async () => ({ data: assistant("<silent/>"), response: { status: 200 } }),
+      async () => ({ data: assistant("<silent/>"), response: { status: 200 } }),
+    )
+    await subject.runPass("root", "idle", {})
+
+    // Then
+    const oracleIndex = client.prompts.findIndex(({ body }) => body.agent === "advisor-oracle")
+    const docsIndex = client.prompts.findIndex(({ body }, index) => body.agent === "advisor-docs" && index > 0)
+    expect(promptText(client, oracleIndex)).toContain("prose step")
+    expect(promptText(client, oracleIndex)).toContain("b.ts")
+    expect(promptText(client, docsIndex)).not.toContain("prose step")
+    expect(promptText(client, docsIndex)).toContain("b.ts")
   })
 })

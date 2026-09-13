@@ -29,6 +29,11 @@ const SKIPPED_PART_TYPES = new Set([
   "patch",
 ])
 
+/** A delivered card is appended to a reviewed message; it is not new work to review. */
+function reviewableParts(parts: readonly Part[]): Part[] {
+  return parts.filter((part) => part.type !== "tool" || !isAdvisorShell(part))
+}
+
 export function sliceDelta(
   messages: readonly TranscriptMessage[],
   cursor: Cursor,
@@ -38,7 +43,7 @@ export function sliceDelta(
   )
   const latest = sorted.at(-1)
   const next: Cursor = latest
-    ? { lastMessageID: latest.info.id, lastPartCount: latest.parts.length }
+    ? { lastMessageID: latest.info.id, lastPartCount: reviewableParts(latest.parts).length }
     : cursor
 
   if (cursor.lastMessageID === undefined) return { delta: sorted, next }
@@ -51,9 +56,13 @@ export function sliceDelta(
   const cursorMessage = sorted[cursorIndex]
   if (cursorMessage === undefined) return { delta: [], next }
 
-  const grew = cursorMessage.parts.length > (cursor.lastPartCount ?? 0)
+  const seen = cursor.lastPartCount ?? 0
+  const parts = reviewableParts(cursorMessage.parts)
+  const after = sorted.slice(cursorIndex + 1)
   return {
-    delta: sorted.slice(cursorIndex + (grew ? 0 : 1)),
+    delta: parts.length > seen
+      ? [{ info: cursorMessage.info, parts: parts.slice(seen) }, ...after]
+      : after,
     next,
   }
 }
@@ -103,7 +112,7 @@ function toolOutput(part: ToolPart): string {
 }
 
 function isAdvisorShell(part: ToolPart): boolean {
-  return part.tool === "bash" && part.state.input["command"] === "advisor"
+  return part.tool === "advisor" || (part.tool === "bash" && part.state.input["command"] === "advisor")
 }
 
 function renderPart(value: unknown): string | undefined {
@@ -135,13 +144,15 @@ function renderPart(value: unknown): string | undefined {
   }
 }
 
+export function isDeliveryMessage(info: Message): boolean {
+  return (
+    (info.role === "user" && (info.agent === "advisor-delivery" || info.id.startsWith("adv_"))) ||
+    (info.role === "assistant" && info.mode === "advisor-delivery")
+  )
+}
+
 function renderMessage(message: RenderableTranscriptMessage): string | undefined {
-  if (
-    (message.info.role === "user" && message.info.agent === "advisor-delivery") ||
-    (message.info.role === "assistant" && message.info.mode === "advisor-delivery")
-  ) {
-    return undefined
-  }
+  if (isDeliveryMessage(message.info)) return undefined
 
   const time = new Date(message.info.time.created).toISOString()
   const heading =

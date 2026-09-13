@@ -1,7 +1,8 @@
 import type { Message, Part, TextPart, UserMessage } from "@opencode-ai/sdk"
 
 import type { Note } from "../notes"
-import { renderBlockerInjection, ROOT_STANDING_RULE } from "../prompts"
+import { findingKey, uniqueFindings } from "../policy"
+import { renderNoteInjection, ROOT_STANDING_RULE } from "../prompts"
 
 export type PendingBlocker = {
   readonly note: Note
@@ -63,11 +64,11 @@ export class BlockerTransformer {
   add(sessionID: string, notes: readonly Note[]): void {
     if (notes.length === 0) return
     const current = this.pendingBlockers.get(sessionID) ?? []
-    const known = new Set(current.map((entry) => entry.note.id))
-    for (const note of notes) {
-      if (!known.has(note.id)) current.push({ note, turnsSeen: 0 })
-    }
-    this.pendingBlockers.set(sessionID, current)
+    const prior = new Map(current.map((entry) => [findingKey(entry.note), entry]))
+    const unique = uniqueFindings([...current.map((entry) => entry.note), ...notes])
+    this.pendingBlockers.set(sessionID, unique.map((note) => ({
+      ...(prior.get(findingKey(note)) ?? { turnsSeen: 0 }), note,
+    })))
   }
 
   removeDelivered(sessionID: string, noteIDs: readonly string[]): void {
@@ -84,7 +85,8 @@ export class BlockerTransformer {
     this.compacting.delete(sessionID)
   }
 
-  messagesTransform(output: MessagesTransformOutput): void {
+  messagesTransform(output: MessagesTransformOutput, assessedIDs?: ReadonlySet<string>): void {
+    output.messages = output.messages.filter((message) => !message.info.id.startsWith("adv_"))
     const sessionID = output.messages[0]?.info.sessionID
     if (
       sessionID === undefined ||
@@ -99,6 +101,11 @@ export class BlockerTransformer {
 
     const active: PendingBlocker[] = []
     for (const blocker of blockers) {
+      // Arrivals outside this read's snapshot stay queued for the next assessment.
+      if (assessedIDs !== undefined && !assessedIDs.has(blocker.note.id)) {
+        active.push(blocker)
+        continue
+      }
       if (blocker.lastAnchorSeen === undefined) blocker.lastAnchorSeen = latestUser.id
       else if (blocker.lastAnchorSeen !== latestUser.id) {
         blocker.turnsSeen += 1
@@ -135,7 +142,7 @@ export class BlockerTransformer {
         sessionID,
         messageID,
         type: "text",
-        text: renderBlockerInjection(
+        text: renderNoteInjection(
           blocker.note,
           blocker.note.model_display,
           blocker.note.variant,

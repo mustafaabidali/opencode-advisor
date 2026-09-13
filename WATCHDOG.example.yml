@@ -2,7 +2,7 @@
 instructions: |
   Review the primary agent independently. Surface only concrete mistakes, missing constraints, security risks, or materially better approaches.
   One note per update. Severity scales by consequence, not category: `nit` when ignoring it costs the user nothing durable, `concern` when it costs real work or ships a defect, `blocker` only when continuing clearly wastes work or ships broken output.
-  If the primary already acknowledged or fixed a point, stay silent. Every note must contain one concrete problem and one concrete fix.
+  If the primary already acknowledged or fixed the same proposal, stay silent. A materially different fix or new evidence may still be useful; explain why it improves the requested outcome. Every note must contain one concrete problem and one concrete fix.
 
 # Advisors run independently and in parallel. Names must be unique.
 advisors:
@@ -33,6 +33,24 @@ advisors:
 
     # `min_severity` overrides the config value: nit, concern, or blocker.
     min_severity: nit
+
+    # `chat_min_severity` and `inject_min_severity` override the config values for this
+    # reviewer's notes: the lowest severity shown as a chat card, and the lowest severity
+    # injected into the primary's next step.
+    chat_min_severity: blocker
+    inject_min_severity: concern
+
+    # `when` gates the reviewer. Without it the reviewer runs on every completed step.
+    # With it, the reviewer runs only when the delta since its last pass contains a match;
+    # skipped deltas carry over. `edits` are globs against the path of a completed edit,
+    # write, or apply_patch, relative to the watched directory (absolute when the glob
+    # starts with /). `commands` are regexes against a completed bash command. `tools` are
+    # bare names of other tools (task, todowrite); edit, write, apply_patch, and bash are
+    # rejected here. An empty or fully invalid `when` never runs and warns at startup.
+    when:
+      edits: ["**/*.ts", "src/**"]
+      commands: ["\\bsed\\s+-i\\b", "\\bcat\\s*>"]
+      tools: [task]
 
   # A second reviewer on a different model family gives an independent view.
   - name: Second reviewer

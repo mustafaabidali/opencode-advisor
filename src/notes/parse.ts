@@ -1,4 +1,4 @@
-import type { AdvisorState, Note, StateSnapshot, TranscriptOutcome } from "./types"
+import type { AdvisorState, Note, ReviewContext, StateSnapshot, TranscriptOutcome } from "./types"
 
 export type PendingPointer = Readonly<{
   noteID: string
@@ -41,6 +41,16 @@ export function parsePendingPointer(text: string): PendingPointer | undefined {
   return noteID === undefined || time === undefined ? undefined : { noteID, time }
 }
 
+function parseReview(value: unknown): ReviewContext | undefined {
+  if (!isRecord(value) || typeof value["task_id"] !== "string" || typeof value["revision"] !== "string") return undefined
+  const userID = value["user_message_id"]
+  if (userID !== undefined && typeof userID !== "string") return undefined
+  return {
+    task_id: value["task_id"], revision: value["revision"],
+    ...(userID === undefined ? {} : { user_message_id: userID }),
+  }
+}
+
 export function parseNote(text: string): Note | undefined {
   const value: unknown = JSON.parse(text)
   if (!isRecord(value)) return undefined
@@ -62,6 +72,12 @@ export function parseNote(text: string): Note | undefined {
   const isFallback = value["is_fallback"]
   const quarantined = value["quarantined"]
   const deliveredAt = value["delivered_at"]
+  const expiredAt = value["expired_at"]
+  const findingID = value["finding_id"]
+  const issueID = value["issue_id"]
+  const failure = value["failure"]
+  const location = value["location"]
+  const review = parseReview(value["review"])
   if (
     id === undefined ||
     time === undefined ||
@@ -80,7 +96,13 @@ export function parseNote(text: string): Note | undefined {
     typeof isFallback !== "boolean" ||
     typeof quarantined !== "boolean" ||
     (severity !== "nit" && severity !== "concern" && severity !== "blocker") ||
-    (deliveredAt !== undefined && typeof deliveredAt !== "string")
+    (deliveredAt !== undefined && typeof deliveredAt !== "string") ||
+    (expiredAt !== undefined && typeof expiredAt !== "string") ||
+    (findingID !== undefined && typeof findingID !== "string") ||
+    (issueID !== undefined && typeof issueID !== "string") ||
+    (failure !== undefined && typeof failure !== "string") ||
+    (location !== undefined && typeof location !== "string") ||
+    (value["review"] !== undefined && review === undefined)
   ) {
     return undefined
   }
@@ -103,6 +125,12 @@ export function parseNote(text: string): Note | undefined {
     is_fallback: isFallback,
     quarantined,
     ...(deliveredAt === undefined ? {} : { delivered_at: deliveredAt }),
+    ...(expiredAt === undefined ? {} : { expired_at: expiredAt }),
+    ...(findingID === undefined ? {} : { finding_id: findingID }),
+    ...(issueID === undefined ? {} : { issue_id: issueID }),
+    ...(failure === undefined ? {} : { failure }),
+    ...(location === undefined ? {} : { location }),
+    ...(review === undefined ? {} : { review }),
   }
 }
 

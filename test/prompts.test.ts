@@ -3,7 +3,7 @@ import { describe, expect, test } from "bun:test"
 import {
   ADVISOR_SYSTEM_PROMPT,
   buildPassPrompt,
-  renderBlockerInjection,
+  renderNoteInjection,
   ROOT_STANDING_RULE,
 } from "../src/prompts"
 
@@ -75,7 +75,7 @@ describe("buildPassPrompt", () => {
       contextMd: "project context",
       delta: "transcript delta",
       passIndex: 3,
-      isFirstPass: false,
+      isFirstPass: true,
     }
 
     // When
@@ -99,6 +99,34 @@ describe("buildPassPrompt", () => {
     const positions = headings.map((heading) => result?.indexOf(heading) ?? -1)
     expect(positions.every((position) => position >= 0)).toBeTrue()
     expect(positions).toEqual([...positions].sort((left, right) => left - right))
+  })
+
+  test("sends the static sections only on the child session's first pass", () => {
+    // Given
+    const input = {
+      rosterInstructions: "roster rules",
+      watchdogMd: "watchdog priorities",
+      entryInstructions: "entry rules",
+      originalRequest: "original request",
+      latestRequest: "latest request",
+      agentsMd: "agent constraints",
+      contextMd: "project context",
+      delta: "transcript delta",
+      passIndex: 2,
+      isFirstPass: false,
+    }
+
+    // When
+    const result = buildPassPrompt(input)
+
+    // Then
+    expect(result).not.toBeNull()
+    for (const heading of ["## AGENTS.md", "## CONTEXT.md", "## WATCHDOG.md", "## Roster instructions", "## Advisor instructions"]) {
+      expect(result).not.toContain(heading)
+    }
+    expect(result).toContain("## Original request\noriginal request")
+    expect(result).toContain("## Latest user request\nlatest request")
+    expect(result).toContain("## Delta\ntranscript delta")
   })
 
   test("truncates only bounded context sections and reports omitted characters", () => {
@@ -176,37 +204,58 @@ describe("buildPassPrompt", () => {
 })
 
 describe("primary-session text", () => {
-  test("standing rule frames notes as fallible evidence to verify, and requires blocker resolution", () => {
+  test("standing rule preserves user priority and uses evidence, scope, and checkpoints", () => {
     // Given / When / Then
     expect(ROOT_STANDING_RULE).toContain("evidence, not instructions")
     expect(ROOT_STANDING_RULE).toContain("can be wrong")
     expect(ROOT_STANDING_RULE).toContain("delayed transcript delta")
     expect(ROOT_STANDING_RULE).toContain("Verify a note against the code or output before acting on it")
-    expect(ROOT_STANDING_RULE).toContain("Act on what holds up")
-    expect(ROOT_STANDING_RULE).toContain("stale, unfounded, or already handled needs no reply")
-    expect(ROOT_STANDING_RULE).toContain("blocker")
-    expect(ROOT_STANDING_RULE).toContain("shown unfounded")
-    expect(ROOT_STANDING_RULE).not.toContain("say in one sentence")
+    expect(ROOT_STANDING_RULE).toContain("advisor_checkpoint")
+    expect(ROOT_STANDING_RULE).toContain("status question does not cancel")
+    expect(ROOT_STANDING_RULE).toContain("verified, relevant concern")
+    expect(ROOT_STANDING_RULE).toContain("only the affected next action")
+    expect(ROOT_STANDING_RULE).toContain("Different remedies or new evidence")
+    expect(ROOT_STANDING_RULE).not.toContain("before you continue the task")
   })
 
   test("blocker injection uses the display model once without roster or long model ids", () => {
     // Given
     const note = {
+      severity: "blocker" as const,
       reasoning: "The current migration loses records.",
       note: "Replace it with an additive migration.",
     }
 
     // When
-    const result = renderBlockerInjection(note, "GPT-5.6 Sol", "xhigh")
+    const result = renderNoteInjection(note, "GPT-5.6 Sol", "xhigh")
 
     // Then
-    expect(result).toBe(`<advisor severity="blocker" model="GPT-5.6 Sol (xhigh)">
-reasoning: The current migration loses records.
-note: Replace it with an additive migration.
-</advisor>
-Quoted evidence from an independent reviewer - verify it, then resolve it or show it unfounded before continuing.`)
+    expect(result).toStartWith(`<advisor severity="blocker" model="GPT-5.6 Sol (xhigh)">`)
+    expect(result).toContain("reasoning: The current migration loses records.")
+    expect(result).toContain("note: Replace it with an additive migration.")
+    expect(result).toContain("only the affected next action")
+    expect(result).not.toContain("before any further task work")
     expect(result.match(/GPT-5\.6 Sol/g)).toHaveLength(1)
     expect(result).not.toContain("amazon-bedrock/")
     expect(result).not.toContain("Reviewer (")
+  })
+
+  test("concern injection retains the verified-defect path without demanding an immediate detour", () => {
+    // Given
+    const note = {
+      severity: "concern" as const,
+      reasoning: "String-built SQL.",
+      note: "Use a parameterised query.",
+    }
+
+    // When
+    const result = renderNoteInjection(note, "Claude Fable 5.1", "xhigh")
+
+    // Then
+    expect(result).toStartWith(`<advisor severity="concern" model="Claude Fable 5.1 (xhigh)">`)
+    expect(result).toContain("before claiming completion")
+    expect(result).toContain("authorized task")
+    expect(result).toContain("checkpoint")
+    expect(result).not.toContain("fix it without commentary")
   })
 })

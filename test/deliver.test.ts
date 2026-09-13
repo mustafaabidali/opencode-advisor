@@ -4,19 +4,73 @@ import type { AssistantMessage, Event, Part, UserMessage } from "@opencode-ai/sd
 
 import { Deliverer, type DelivererOptions } from "../src/deliver"
 import type { LogFields, Logger } from "../src/log"
-import type { Note } from "../src/notes"
+import { renderCard, type Note } from "../src/notes"
 import { ROOT_STANDING_RULE } from "../src/prompts"
 
 const NOW = 1_789_000_000_000
+const fixtureNotes = new Map<string, Note>()
 
-function note(id: string, severity: Note["severity"] = "concern"): Note {
-  return {
+test("a later independent proposal arriving during a transform read remains injectable", async () => {
+  const harness = makeHarness({ chatMinSeverity: "blocker", injectMinSeverity: "concern" })
+  await harness.deliverer.deliver("root-1", [note("first-review")])
+  const earlierRead = Promise.withResolvers<[]>()
+  const transformRead = Promise.withResolvers<[]>()
+  let reads = 0
+  harness.store.listFindings = async () => (++reads === 1 ? earlierRead.promise : transformRead.promise)
+  const later = harness.deliverer.deliver("root-1", [note("later-alternative")])
+  const output = { messages: [userMessage("primary-request")] }
+  const transform = harness.deliverer.messagesTransform(output)
+  expect(reads).toBe(2)
+
+  // The later review requested its assessment before the transform requested its snapshot.
+  earlierRead.resolve([])
+  await later
+  transformRead.resolve([])
+  await transform
+
+  expect(output.messages.filter(({ info }) => info.id.startsWith("adv_")).map(({ info }) => info.id).sort())
+    .toEqual(["adv_first-review"])
+  expect(harness.deliverer.pendingBlockers.get("root-1")?.map(({ note }) => note.id).sort())
+    .toEqual(["first-review", "later-alternative"])
+  await harness.deliverer.messagesTransform(output)
+  expect(output.messages.filter(({ info }) => info.id.startsWith("adv_")).map(({ info }) => info.id).sort())
+    .toEqual(["adv_first-review", "adv_later-alternative"])
+})
+
+test.each(["stop", "replace"] as const)("late advice cannot bypass a task %s during a transform read", async (steering) => {
+  let context = { task_id: "task-1", revision: "r1", stopped: false }
+  const harness = makeHarness({
+    chatMinSeverity: "blocker", injectMinSeverity: "concern", context: () => context,
+  })
+  const review = { task_id: "task-1", revision: "r1" }
+  await harness.deliverer.deliver("root-1", [{ ...note("first-review"), review }])
+  const earlierRead = Promise.withResolvers<[]>()
+  const transformRead = Promise.withResolvers<[]>()
+  let reads = 0
+  harness.store.listFindings = async () => (++reads === 1 ? earlierRead.promise : transformRead.promise)
+  const later = harness.deliverer.deliver("root-1", [{ ...note("later-alternative"), review }])
+  const output = { messages: [userMessage("primary-request")] }
+  const transform = harness.deliverer.messagesTransform(output)
+  expect(reads).toBe(2)
+  earlierRead.resolve([])
+  await later
+  context = steering === "stop" ? { ...context, stopped: true } : { ...context, task_id: "task-2" }
+  transformRead.resolve([])
+  await transform
+  expect(output.messages.filter(({ info }) => info.id.startsWith("adv_"))).toEqual([])
+  await harness.deliverer.messagesTransform(output)
+  expect(output.messages.filter(({ info }) => info.id.startsWith("adv_"))).toEqual([])
+  expect(harness.deliverer.pendingBlockers.has("root-1")).toBeFalse()
+})
+
+function note(id: string, severity: Note["severity"] = "concern", advisor_slug = "reviewer"): Note {
+  const result: Note = {
     id,
     time: "2026-09-10T12:00:00.000Z",
     cwd: "/workspace/project",
     root_session: "root-1",
     advisor_session: "advisor-1",
-    advisor_slug: "reviewer",
+    advisor_slug,
     roster_name: "Hidden reviewer",
     provider: "amazon-bedrock",
     model: "amazon-bedrock/openai.gpt-5.6-sol",
@@ -25,10 +79,12 @@ function note(id: string, severity: Note["severity"] = "concern"): Note {
     severity,
     reasoning: `reasoning ${id}`,
     note: `note ${id}`,
-    evidence: [],
+    evidence: ["Checked the failing fixture"],
     is_fallback: false,
     quarantined: false,
   }
+  fixtureNotes.set(id, result)
+  return result
 }
 
 function userMessage(id: string, agent = "build"): { info: UserMessage; parts: Part[] } {
@@ -93,11 +149,21 @@ function makeHarness(
     abortOnBlocker?: boolean
     toast?: boolean
     ttl?: number
+    chatMinSeverity?: "nit" | "concern" | "blocker"
+    injectMinSeverity?: "nit" | "concern" | "blocker"
+    floors?: DelivererOptions["floors"]
+    context?: DelivererOptions["context"]
     watched?: boolean
     toastRejects?: boolean
     shellStatuses?: readonly number[]
     shellThrows?: boolean
     shellEnvelope?: boolean
+    shellOutput?: string
+    shellToolStatus?: "completed" | "error"
+    shellExit?: number
+    deliveryStatus?: "expired"
+    beforeShell?: (index: number) => Promise<void>
+    nativeRender?: (input: Readonly<{ note: Note; canRender: () => boolean }>) => Promise<string | undefined>
     markDeliveredThrows?: boolean
   }> = {},
 ): Harness {
@@ -110,6 +176,14 @@ function makeHarness(
   const pending = new Set<string>()
   const shellStatuses = [...(options.shellStatuses ?? [200])]
   const store = {
+    listFindings: async () => [],
+    deliveredFindingIDs: async () => new Set<string>(),
+    readForDelivery: async (_cwd: string, id: string, _ttl: number) => {
+      if (options.deliveryStatus !== undefined) return { status: options.deliveryStatus }
+      const entry = fixtureNotes.get(id)
+      if (entry === undefined) return { status: "missing" as const }
+      return { status: "ready" as const, note: entry }
+    },
     enqueuePending: async (_cwd, ids) => {
       calls.push("enqueue")
       for (const id of ids) pending.add(id)
@@ -125,17 +199,34 @@ function makeHarness(
     },
   } satisfies DelivererOptions["store"]
   const client = {
+    ...(options.nativeRender === undefined ? {} : { renderNote: options.nativeRender }),
     session: {
       shell: async (input) => {
         calls.push("shell")
         shellCalls.push(input)
+        await options.beforeShell?.(shellCalls.length)
         if (options.shellThrows === true) throw new TypeError("transport failed")
         const status = shellStatuses.shift() ?? 200
         const response = new Response(null, { status })
         if (!response.ok) return { data: undefined, error: { message: "failed" }, response }
         const message = shellMessage()
+        const renderedNote = fixtureNotes.get(input.body.command.split(" ").at(-1) ?? "")
+        if (renderedNote === undefined) throw new Error("missing fixture note")
         return {
-          data: options.shellEnvelope === true ? { info: message, parts: [] } : message,
+          data: {
+                info: message,
+                parts: [{
+                  id: "shell-tool", messageID: message.id, sessionID: message.sessionID,
+                  type: "tool",
+                  tool: "bash",
+                  state: {
+                    status: options.shellToolStatus ?? "completed",
+                    input: { command: input.body.command },
+                    output: options.shellOutput ?? `${renderCard(renderedNote)}\n`,
+                    metadata: { exit: options.shellExit ?? 0 },
+                  },
+                }],
+              },
           error: undefined,
           response,
         }
@@ -173,7 +264,12 @@ function makeHarness(
         toast: options.toast ?? true,
         abort_on_blocker: options.abortOnBlocker ?? false,
         note_ttl_turns: options.ttl ?? 2,
+        chat_min_severity: options.chatMinSeverity ?? "nit",
+        inject_min_severity: options.injectMinSeverity ?? "blocker",
+        pending_ttl_ms: 600_000,
       },
+      ...(options.floors === undefined ? {} : { floors: options.floors }),
+      ...(options.context === undefined ? {} : { context: options.context }),
       store,
       log,
       client,
@@ -195,6 +291,165 @@ async function status(deliverer: Deliverer, type: "busy" | "idle"): Promise<void
 }
 
 describe("Deliverer cards and notifications", () => {
+  test("reviewer blocker labels cannot abort an unrelated user turn, even with the legacy opt-in", async () => {
+    const harness = makeHarness({ toast: false, abortOnBlocker: true })
+    await harness.deliverer.deliver("root-1", [note("unverified-blocker", "blocker")])
+    expect(harness.calls).not.toContain("abort")
+  })
+
+  test("renders through the controlled card client without launching a shell", async () => {
+    const rendered: string[] = []
+    const harness = makeHarness({
+      toast: false,
+      nativeRender: async ({ note, canRender }) => {
+        expect(canRender()).toBeTrue()
+        rendered.push(note.id)
+        return "native-card-message"
+      },
+    })
+    await status(harness.deliverer, "idle")
+    await harness.deliverer.deliver("root-1", [note("block-1", "blocker")])
+
+    expect(rendered).toEqual(["block-1"])
+    expect(harness.shellCalls).toHaveLength(0)
+    expect(harness.calls.filter((entry) => entry === "delivered")).toHaveLength(1)
+    expect(harness.suppressed).toHaveLength(0)
+  })
+
+  test("never renders on an unwatched session even when it is idle", async () => {
+    const harness = makeHarness({ watched: false, toast: false })
+    await status(harness.deliverer, "idle")
+    await harness.deliverer.deliver("root-1", [note("unwatched", "blocker")])
+    expect(harness.shellCalls).toHaveLength(0)
+    expect(harness.calls).not.toContain("delivered")
+  })
+
+  test("native delivery resumes after a real user finishes while the first card is in flight", async () => {
+    const rendered: string[] = []
+    const harness = makeHarness({
+      toast: false,
+      nativeRender: async ({ note }) => {
+        rendered.push(note.id)
+        if (rendered.length === 1) {
+          harness.deliverer.onUserMessage(userMessage("fast-user-turn").info)
+          await harness.deliverer.onEvent({
+            type: "message.updated",
+            properties: { info: { ...shellMessage(), id: "primary-answer", mode: "build", parentID: "fast-user-turn" } },
+          })
+          await status(harness.deliverer, "idle")
+        }
+        return "native-message"
+      },
+    })
+    await status(harness.deliverer, "idle")
+    await harness.deliverer.deliver("root-1", [note("first-native", "blocker"), note("next-native", "blocker")])
+    expect(rendered).toEqual(["first-native", "next-native"])
+  })
+
+  test("a real user turn interrupts a card batch even when the first card emits its own idle event", async () => {
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    const harness = makeHarness({
+      toast: false,
+      beforeShell: async (index) => {
+        if (index !== 1) return
+        entered.resolve()
+        await release.promise
+      },
+    })
+    await harness.deliverer.deliver("root-1", [note("a-1"), note("b-2")])
+    const flushing = status(harness.deliverer, "idle")
+    await entered.promise
+    await harness.deliverer.onEvent({
+      type: "message.updated", properties: { info: userMessage("u-new").info },
+    })
+    await status(harness.deliverer, "busy")
+    await harness.deliverer.onEvent({
+      type: "message.updated", properties: { info: userMessage("delivery-u", "advisor-delivery").info },
+    })
+    await status(harness.deliverer, "idle")
+    release.resolve()
+    await flushing
+
+    expect(harness.shellCalls).toHaveLength(1)
+    await status(harness.deliverer, "idle")
+    expect(harness.shellCalls).toHaveLength(1)
+
+    await harness.deliverer.onEvent({
+      type: "message.updated",
+      properties: { info: { ...shellMessage(), id: "primary-reply", parentID: "u-new", mode: "build" } },
+    })
+    await status(harness.deliverer, "idle")
+    expect(harness.shellCalls).toHaveLength(2)
+  })
+
+  test("expires a stale note without rendering an empty card, acknowledging it, or retrying it", async () => {
+    const harness = makeHarness({ toast: false, deliveryStatus: "expired" })
+    await harness.deliverer.deliver("root-1", [note("block-1", "blocker")])
+
+    await status(harness.deliverer, "idle")
+    await status(harness.deliverer, "idle")
+
+    expect(harness.shellCalls).toHaveLength(0)
+    expect(harness.calls).not.toContain("delivered")
+    expect(harness.deliverer.pendingBlockers.get("root-1") ?? []).toEqual([])
+    expect(harness.infos.some((entry) => entry["msg"] === "advisor card expired")).toBeFalse()
+    expect(harness.infos.filter((entry) => entry["msg"] === "advisor card skipped")).toEqual([
+      { msg: "advisor card skipped", sessionID: "root-1", noteIDs: ["block-1"], status: "expired" },
+    ])
+    expect(harness.infos.some((entry) => entry["msg"] === "advisor card delivered")).toBeFalse()
+  })
+
+  test("a note the policy withholds is logged with its reason instead of vanishing", async () => {
+    const harness = makeHarness({ toast: false })
+    await status(harness.deliverer, "idle")
+    const unsupported = { ...note("no-evidence", "blocker"), evidence: [] }
+
+    await harness.deliverer.deliver("root-1", [unsupported])
+
+    expect(harness.shellCalls).toHaveLength(0)
+    expect(harness.deliverer.pendingBlockers.get("root-1") ?? []).toEqual([])
+    expect(harness.infos).toEqual([{
+      msg: "advisor note withheld",
+      sessionID: "root-1",
+      notes: [{ noteID: "no-evidence", reason: "unsupported_observation" }],
+    }])
+  })
+
+  test("a card waits for the primary's completed reply even when idle arrives before it", async () => {
+    const rendered: string[] = []
+    const harness = makeHarness({ toast: false, nativeRender: async ({ note }) => { rendered.push(note.id); return "m" } })
+    await status(harness.deliverer, "idle")
+    harness.deliverer.onUserMessage(userMessage("u-late").info)
+    await status(harness.deliverer, "busy")
+    await harness.deliverer.deliver("root-1", [note("late-card", "blocker")])
+    await status(harness.deliverer, "idle")
+    expect(rendered).toEqual([])
+
+    await harness.deliverer.onEvent({
+      type: "message.updated",
+      properties: { info: { ...shellMessage(), id: "primary-reply", parentID: "u-late", mode: "build" } },
+    })
+
+    expect(rendered).toEqual(["late-card"])
+  })
+
+  test.each([
+    { shellOutput: "Unknown option: u\nUnknown option: u\n" },
+    { shellOutput: "Advisor · no pending notes\n" },
+    { shellToolStatus: "error" as const },
+    { shellExit: 1 },
+  ])("HTTP 200 with an invalid render does not acknowledge or clear the note: %j", async (response) => {
+    const harness = makeHarness({ toast: false, ...response })
+    await harness.deliverer.deliver("root-1", [note("block-1", "blocker")])
+
+    await status(harness.deliverer, "idle")
+
+    expect(harness.calls).not.toContain("delivered")
+    expect(harness.deliverer.pendingBlockers.get("root-1")?.map((entry) => entry.note.id)).toEqual(["block-1"])
+    expect(harness.infos.some((entry) => entry["msg"] === "advisor card delivered")).toBeFalse()
+  })
+
   test("logs queued, delivered, and blocker-cleared card transitions", async () => {
     // Given
     const harness = makeHarness({ toast: false })
@@ -219,9 +474,10 @@ describe("Deliverer cards and notifications", () => {
         messageID: "shell-assistant",
       },
       {
-        msg: "blocker cleared after card",
+        msg: "advisor injection cleared after card",
         sessionID: "root-1",
         noteIDs: ["block-1"],
+        severity: "blocker",
       },
       {
         msg: "advisor card delivered",
@@ -309,7 +565,7 @@ describe("Deliverer cards and notifications", () => {
     expect(harness.calls.filter((call) => call === "removed")).toHaveLength(0)
   })
 
-  test("queues blockers, emits severity toasts, and aborts only when opted in", async () => {
+  test("queues blockers and emits opted-in severity toasts without trusting the severity label", async () => {
     // Given
     const optedOut = makeHarness()
     const optedIn = makeHarness({ abortOnBlocker: true })
@@ -323,8 +579,62 @@ describe("Deliverer cards and notifications", () => {
       "block-1",
     ])
     expect(optedOut.calls).not.toContain("abort")
-    expect(optedIn.calls.filter((call) => call === "abort")).toHaveLength(1)
+    expect(optedIn.calls.filter((call) => call === "abort")).toHaveLength(0)
     expect(optedOut.toastBodies.map((input) => input.body.variant)).toEqual(["error", "warning"])
+  })
+
+  test("keeps notes below chat_min_severity out of the chat while still toasting and injecting blockers", async () => {
+    // Given
+    const harness = makeHarness({ chatMinSeverity: "blocker" })
+    await status(harness.deliverer, "busy")
+
+    // When
+    await harness.deliverer.deliver("root-1", [note("block-1", "blocker"), note("c-1"), note("n-1", "nit")])
+
+    // Then
+    expect(harness.deliverer.pendingBlockers.get("root-1")?.map((entry) => entry.note.id)).toEqual(["block-1"])
+    expect(harness.toastBodies.map((input) => input.body.variant)).toEqual(["error", "warning", "info"])
+    expect(harness.calls.filter((call) => call === "enqueue")).toHaveLength(1)
+    expect(harness.infos.find((fields) => fields["msg"] === "advisor card withheld")).toEqual({
+      msg: "advisor card withheld",
+      sessionID: "root-1",
+      noteIDs: ["c-1", "n-1"],
+    })
+
+    // When
+    await status(harness.deliverer, "idle")
+
+    // Then
+    expect(harness.shellCalls.map((call) => call.body.command)).toEqual(["advisor --note block-1"])
+    expect(harness.infos.filter((fields) => fields["msg"] === "advisor card queued")).toHaveLength(1)
+  })
+
+  test("applies each advisor's own floors when a floors resolver is given, falling back to config", async () => {
+    // Given
+    const floors: DelivererOptions["floors"] = (slug) =>
+      slug === "oracle" ? { chat_min_severity: "blocker", inject_min_severity: "concern" }
+      : slug === "docs" ? { chat_min_severity: "nit", inject_min_severity: "blocker" }
+      : undefined
+    const harness = makeHarness({ floors, chatMinSeverity: "blocker", injectMinSeverity: "blocker" })
+    await status(harness.deliverer, "busy")
+
+    // When
+    await harness.deliverer.deliver("root-1", [
+      note("o-concern", "concern", "oracle"),
+      note("d-nit", "nit", "docs"),
+      note("x-concern", "concern", "unknown"),
+    ])
+
+    // Then
+    expect(harness.deliverer.pendingBlockers.get("root-1")?.map((entry) => entry.note.id)).toEqual(["o-concern"])
+    expect(harness.toastBodies).toHaveLength(3)
+    expect(harness.infos.find((fields) => fields["msg"] === "advisor card withheld")?.["noteIDs"]).toEqual(["o-concern", "x-concern"])
+
+    // When
+    await status(harness.deliverer, "idle")
+
+    // Then
+    expect(harness.shellCalls.map((call) => call.body.command)).toEqual(["advisor --note d-nit"])
   })
 
   test("never shells while busy and flushes the queued card on the next idle", async () => {
@@ -509,7 +819,7 @@ describe("Deliverer blocker transform", () => {
     expect(compacting.deliverer.compacting.has("root-1")).toBeFalse()
   })
 
-  test("never injects concerns", async () => {
+  test("does not inject concerns when the injection floor is blocker", async () => {
     // Given
     const harness = makeHarness()
     await harness.deliverer.deliver("root-1", [note("concern-1")])
@@ -520,6 +830,24 @@ describe("Deliverer blocker transform", () => {
 
     // Then
     expect(output.messages).toHaveLength(1)
+  })
+
+  test("injects concerns but never nits when inject_min_severity is concern, even with no chat card", async () => {
+    // Given
+    const harness = makeHarness({ injectMinSeverity: "concern", chatMinSeverity: "blocker" })
+    await status(harness.deliverer, "idle")
+    await harness.deliverer.deliver("root-1", [note("concern-1"), note("nit-1", "nit")])
+    const output = { messages: [userMessage("u-1")] }
+
+    // When
+    await harness.deliverer.messagesTransform(output)
+
+    // Then
+    expect(harness.shellCalls).toHaveLength(0)
+    expect(output.messages.map((message) => message.info.id)).toEqual(["adv_concern-1", "u-1"])
+    const text = output.messages[0]?.parts[0]
+    expect(text?.type === "text" ? text.text : "").toContain('<advisor severity="concern"')
+    expect(text?.type === "text" ? text.text : "").toContain("Honor the user's latest steering first")
   })
 })
 

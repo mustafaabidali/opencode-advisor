@@ -16,6 +16,9 @@ import type {
 
 import type { ConfigEnvironment } from "../src/config"
 import type { LogFields, Logger, LoggerOptions } from "../src/log"
+import { NoteStore } from "../src/notes"
+import { TaskContexts } from "../src/advisor/context"
+import { checkpointTool } from "../src/plugin/checkpoint"
 
 const NOW = 1_789_000_000_000
 const ROOT_ID = "root-session"
@@ -56,6 +59,7 @@ class FakeTimers {
 
 class FakeClient {
   readonly promptCalls: PromptProbe[] = []
+  readonly abortCalls: string[] = []
   providerCalls = 0
 
   constructor(
@@ -101,11 +105,14 @@ class FakeClient {
         response: new Response(null, { status: 200 }),
       }
     },
-    abort: async () => ({
-      data: true,
-      error: undefined,
-      response: new Response(null, { status: 200 }),
-    }),
+    abort: async (call: Readonly<{ path: Readonly<{ id: string }> }>) => {
+      this.abortCalls.push(call.path.id)
+      return {
+        data: true,
+        error: undefined,
+        response: new Response(null, { status: 200 }),
+      }
+    },
     shell: async () => ({
       data: advisorResponse().info,
       error: undefined,
@@ -269,15 +276,271 @@ async function removeHarness(path: string): Promise<void> {
 }
 
 async function until(predicate: () => boolean): Promise<void> {
-  for (let attempt = 0; attempt < 50; attempt += 1) {
+  const deadline = Date.now() + 1500
+  while (Date.now() < deadline) {
     if (predicate()) return
-    await new Promise<void>((resolve) => setImmediate(resolve))
+    await new Promise<void>((resolve) => setTimeout(resolve, 5))
   }
   throw new Error("test condition was not reached")
 }
 
 describe("advisor plugin entry", () => {
-  test("returns exactly the six coexistence-safe hooks", async () => {
+  test("a checkpoint awaiting reports cannot abort after its instance is disposed", async () => {
+    const harness = await makeHarness()
+    const client = new FakeClient()
+    class GatedNoteStore extends NoteStore {
+      paused = false
+      readonly reading = Promise.withResolvers<void>()
+      readonly release = Promise.withResolvers<void>()
+      override async readNotes(...args: Parameters<NoteStore["readNotes"]>) {
+        const notes = await super.readNotes(...args)
+        if (this.paused) {
+          this.reading.resolve()
+          await this.release.promise
+        }
+        return notes
+      }
+    }
+    const log = harness.dependencies.createLogger({ level: "info" })
+    const store = new GatedNoteStore({ dataDir: join(harness.temporaryRoot, "checkpoint-data"), log })
+    let watched = true
+    const checkpoint = checkpointTool({
+      client, config: { abort_on_blocker: true }, contexts: new TaskContexts(store, harness.directory),
+      log, store, directory: harness.directory, isWatched: () => watched,
+    })
+    const context = {
+      sessionID: ROOT_ID, messageID: "checkpoint", agent: "build", directory: harness.directory,
+      worktree: harness.directory, abort: new AbortController().signal, metadata: () => {}, ask: async () => {},
+    }
+    try {
+      await checkpoint.execute({ phase: "inspect", task: "continue", updates: [] }, context)
+      const captured = await store.readTask(harness.directory, ROOT_ID)
+      if (captured === undefined) throw new Error("Checkpoint did not capture its task")
+      const note = await store.writeNote({
+        cwd: harness.directory, root_session: ROOT_ID, advisor_session: "advisor-session",
+        advisor_slug: "reviewer", roster_name: "Reviewer", provider: "amazon-bedrock",
+        model: "amazon-bedrock/openai.gpt-5.6-sol", model_display: "GPT-5.6 Sol", variant: "max",
+        severity: "blocker", reasoning: "The publish step ships the failing build",
+        note: "Fix the build before publishing", evidence: ["bun run build exits 1"],
+        review: captured, is_fallback: false, quarantined: false,
+      })
+      await store.recordDispositions(harness.directory, ROOT_ID, [{
+        id: note.id, state: "open", reviewed_revision: captured.revision, version: 0,
+        reason: "Reproduced the failing build", evidence: ["bun run build exits 1"],
+        verification: {
+          revision: captured.revision, in_scope: true, affected_action: "publish",
+          cost_if_delayed: "a broken release ships",
+        },
+      }])
+      store.paused = true
+      const inFlight = checkpoint.execute({
+        phase: "before_action", task: "continue", next_action: "publish", updates: [],
+      }, context)
+      await store.reading.promise
+      watched = false
+      await store.close()
+      store.release.resolve()
+      const result = await inFlight
+      expect(client.abortCalls).toEqual([])
+      expect(result).toContain("only in a watched primary session")
+    } finally {
+      store.release.resolve()
+      await store.close()
+      await removeHarness(harness.temporaryRoot)
+    }
+  })
+
+  test("disposing one instance stops its checkpoints and timers while another shared-data instance remains usable", async () => {
+    const plugin = await loadPlugin()
+    if (plugin === undefined) throw new Error("Plugin module missing")
+    const first = await makeHarness()
+    const second = await makeHarness({ environment: first.environment })
+    const a = await plugin.createAdvisorHooks({ client: new FakeClient(), directory: first.directory }, first.dependencies)
+    const b = await plugin.createAdvisorHooks({ client: new FakeClient(), directory: second.directory }, second.dependencies)
+    const inspect = async (hooks: typeof a, harness: typeof first) => {
+      const checkpoint = hooks.tool?.["advisor_checkpoint"]
+      if (checkpoint === undefined) throw new Error("Checkpoint tool missing")
+      return checkpoint.execute({ phase: "inspect", task: "continue", updates: [] }, {
+        sessionID: ROOT_ID, messageID: "checkpoint", agent: "build", directory: harness.directory, worktree: harness.directory,
+        abort: new AbortController().signal, metadata: () => {}, ask: async () => {},
+      })
+    }
+    const dispose = (directory: string) => ({ type: "server.instance.disposed" as const, properties: { directory } })
+    try {
+      await a.event?.({ event: sessionCreated(first.directory) })
+      await b.event?.({ event: sessionCreated(second.directory) })
+      await inspect(a, first)
+      await inspect(b, second)
+      await a.event?.({ event: {
+        type: "message.updated", properties: { info: {
+          ...advisorResponse().info, sessionID: ROOT_ID, mode: "build",
+        } },
+      } })
+      expect(first.dependencies.timers.pending.size).toBe(1)
+
+      await a.event?.({ event: dispose(first.directory) })
+      await b.event?.({ event: dispose(first.directory) })
+      expect(first.dependencies.timers.pending.size).toBe(0)
+      expect(await inspect(a, first)).toContain("only in a watched primary session")
+      expect(await inspect(b, second)).toContain('"action_allowed":true')
+      await a.event?.({ event: sessionIdle() })
+      expect(first.logs.some(({ fields }) => fields["msg"] === "advisor pass start")).toBeFalse()
+    } finally {
+      await a.event?.({ event: dispose(first.directory) })
+      await b.event?.({ event: dispose(second.directory) })
+      await removeHarness(first.temporaryRoot)
+      await removeHarness(second.temporaryRoot)
+    }
+  })
+
+  test("makes the fast review available to the primary before the slow review finishes", async () => {
+    const plugin = await loadPlugin()
+    if (plugin === undefined) throw new Error("Plugin module missing")
+    const harness = await makeHarness({
+      exists: (path) => path.endsWith("WATCHDOG.yml"),
+      readFile: async (path) => path.endsWith("WATCHDOG.yml")
+        ? "advisors:\n  - name: Fast\n  - name: Slow\n"
+        : harnessReadFile(path),
+    })
+    const fake = new FakeClient()
+    const slow = Promise.withResolvers<void>()
+    let calls = 0
+    let children = 0
+    let slowDone = false
+    const client = {
+      ...fake, session: {
+        ...fake.session,
+        create: async () => ({ data: { id: `advisor-session-${++children}` }, error: undefined, response: new Response() }),
+        prompt: async () => {
+          const index = ++calls
+          if (index === 2) { await slow.promise; slowDone = true }
+          const response = advisorResponse()
+          return {
+            data: { ...response, parts: [{
+              id: `review-${index}`, type: "text" as const, sessionID: response.info.sessionID, messageID: response.info.id,
+              text: `<advice severity="concern">reasoning: Reproduced the failure\nnote: Fix ${index}\nevidence: failing regression</advice>`,
+            }] }, error: undefined, response: new Response(),
+          }
+        },
+      },
+    }
+    try {
+      const hooks = await plugin.createAdvisorHooks({ client, directory: harness.directory }, harness.dependencies)
+      await hooks.event?.({ event: sessionCreated(harness.directory) })
+      await hooks.event?.({ event: sessionIdle() })
+      await until(() => calls === 2 && harness.logs.some(({ fields }) => fields["msg"] === "advisor card withheld"))
+      const output = { messages: [{ ...userTranscriptMessage(ROOT_SENTINEL), parts: [] as Part[] }] }
+      await hooks["experimental.chat.messages.transform"]?.({}, output)
+      expect(JSON.stringify(output)).toContain("Fix 1")
+      expect(slowDone).toBeFalse()
+      slow.resolve()
+      await until(() => harness.logs.some(({ fields }) => fields["msg"] === "advisor pass end"))
+      await hooks["experimental.chat.messages.transform"]?.({}, output)
+      expect(JSON.stringify(output)).toContain("Fix 2")
+      expect(fake.abortCalls).toHaveLength(0)
+    } finally {
+      slow.resolve()
+      await until(() => harness.logs.some(({ fields }) => fields["msg"] === "advisor pass end"))
+      await removeHarness(harness.temporaryRoot)
+    }
+  })
+
+  test("the checkpoint tool preserves stop and refuses reviewer or unwatched sessions", async () => {
+    const plugin = await loadPlugin()
+    if (plugin === undefined) throw new Error("Plugin module missing")
+    const harness = await makeHarness()
+    const client = new FakeClient()
+    try {
+      const hooks = await plugin.createAdvisorHooks({ client, directory: harness.directory }, harness.dependencies)
+      await hooks.event?.({ event: sessionCreated(harness.directory) })
+      const checkpoint = hooks.tool?.["advisor_checkpoint"]
+      if (checkpoint === undefined) throw new Error("Checkpoint tool missing")
+      const context = {
+        sessionID: ROOT_ID, messageID: "checkpoint", agent: "build",
+        directory: harness.directory, worktree: harness.directory, abort: new AbortController().signal,
+        metadata: () => {}, ask: async () => { throw new Error("Unexpected permission request") },
+      }
+      await checkpoint.execute({ phase: "inspect", task: "stop", updates: [] }, context)
+      const result = await checkpoint.execute({ phase: "inspect", task: "continue", updates: [] }, context)
+      if (typeof result !== "string") throw new Error("Expected a JSON checkpoint result")
+      const report: unknown = JSON.parse(result)
+      expect(report).toMatchObject({ action_allowed: false, context: { stopped: true } })
+      expect(await checkpoint.execute({ phase: "inspect", task: "continue", updates: [] },
+        { ...context, agent: "advisor-reviewer" })).toContain("only in a watched primary session")
+      expect(await checkpoint.execute({ phase: "inspect", task: "continue", updates: [] },
+        { ...context, sessionID: "other-session" })).toContain("only in a watched primary session")
+      expect(client.promptCalls).toHaveLength(0)
+    } finally {
+      await removeHarness(harness.temporaryRoot)
+    }
+  })
+
+  test("abort_on_blocker pauses only the named action once a blocker is verified against it", async () => {
+    const plugin = await loadPlugin()
+    if (plugin === undefined) throw new Error("Plugin module missing")
+    const harness = await makeHarness({
+      readFile: async (path) => path.endsWith("advisor.jsonc")
+        ? JSON.stringify({ ...JSON.parse(HARNESS_CONFIG), abort_on_blocker: true })
+        : readFile(path, "utf8"),
+    })
+    const client = new FakeClient()
+    try {
+      const hooks = await plugin.createAdvisorHooks({ client, directory: harness.directory }, harness.dependencies)
+      await hooks.event?.({ event: sessionCreated(harness.directory) })
+      const checkpoint = hooks.tool?.["advisor_checkpoint"]
+      if (checkpoint === undefined) throw new Error("Checkpoint tool missing")
+      const context = {
+        sessionID: ROOT_ID, messageID: "checkpoint", agent: "build",
+        directory: harness.directory, worktree: harness.directory, abort: new AbortController().signal,
+        metadata: () => {}, ask: async () => { throw new Error("Unexpected permission request") },
+      }
+      const run = async (args: Record<string, unknown>) => {
+        const result = await checkpoint.execute({ phase: "inspect", task: "continue", updates: [], ...args }, context)
+        if (typeof result !== "string") throw new Error("Expected a JSON checkpoint result")
+        return JSON.parse(result) as { action_allowed: boolean; context: { task_id: string; revision: string } }
+      }
+      const { context: captured } = await run({})
+      const store = new NoteStore({ dataDir: join(harness.temporaryRoot, "data", "opencode-advisor"), log: harness.dependencies.createLogger({ level: "info" }) })
+      const note = await store.writeNote({
+        cwd: harness.directory, root_session: ROOT_ID, advisor_session: "advisor-session",
+        advisor_slug: "reviewer", roster_name: "Reviewer", provider: "amazon-bedrock",
+        model: "amazon-bedrock/openai.gpt-5.6-sol", model_display: "GPT-5.6 Sol", variant: "max",
+        severity: "blocker", reasoning: "The publish step ships the failing build",
+        note: "Fix the build before publishing", evidence: ["bun run build exits 1"],
+        review: { task_id: captured.task_id, revision: captured.revision },
+        is_fallback: false, quarantined: false,
+      })
+      const verified = await run({
+        updates: [{
+          id: note.id, state: "open", reviewed_revision: captured.revision, version: 0, reason: "Reproduced the failing build",
+          evidence: ["bun run build exits 1"],
+          verification: { in_scope: true, affected_action: "publish", cost_if_delayed: "a broken release ships" },
+        }],
+      })
+      expect(verified.action_allowed).toBeTrue()
+      expect(client.abortCalls).toEqual([])
+
+      const unrelated = await run({ phase: "before_action", next_action: "lint" })
+      expect(unrelated.action_allowed).toBeTrue()
+      expect(client.abortCalls).toEqual([])
+
+      const paused = await run({ phase: "before_action", next_action: "publish" })
+      expect(paused.action_allowed).toBeFalse()
+      expect(client.abortCalls).toEqual([ROOT_ID])
+      expect(harness.logs.some(({ fields }) => fields["msg"] === "advisor blocker paused the named action" &&
+        fields["next_action"] === "publish")).toBeTrue()
+      await rm(join(harness.temporaryRoot, "data", "opencode-advisor", "notes", `${note.id}.json`))
+      const unavailable = await run({ phase: "before_action", next_action: "publish" })
+      expect(unavailable.action_allowed).toBeFalse()
+      expect(client.abortCalls).toEqual([ROOT_ID, ROOT_ID])
+      expect((await run({ phase: "before_action", next_action: "lint" })).action_allowed).toBeTrue()
+      expect(client.abortCalls).toEqual([ROOT_ID, ROOT_ID])
+    } finally {
+      await removeHarness(harness.temporaryRoot)
+    }
+  })
+
+  test("returns the coexistence hooks and the primary checkpoint tool", async () => {
     // Given
     const plugin = await loadPlugin()
     expect(plugin).toBeDefined()
@@ -299,6 +562,7 @@ describe("advisor plugin entry", () => {
         "experimental.chat.messages.transform",
         "experimental.chat.system.transform",
         "experimental.session.compacting",
+        "tool",
       ])
       expect(plugin.default).toEqual({ id: "advisor", server: plugin.server })
     } finally {
@@ -354,7 +618,7 @@ describe("advisor plugin entry", () => {
       )
 
       // Then
-      expect(Object.keys(hooks)).toHaveLength(6)
+      expect(Object.keys(hooks)).toHaveLength(7)
       expect(
         harness.logs.some(
           ({ level, fields }) => level === "warn" && fields["source"] === "roster",
@@ -451,7 +715,7 @@ describe("advisor plugin entry", () => {
         chatOutput(ADVISOR_SENTINEL),
       )
       await event({ event: sessionIdle() })
-      await until(() => client.promptCalls.length === 1)
+      await until(() => harness.logs.some(({ fields }) => fields["msg"] === "advisor pass end"))
 
       // Then
       const prompt = client.promptCalls[0]?.body.parts[0].text ?? ""
@@ -483,7 +747,7 @@ describe("advisor plugin entry", () => {
 
       // When
       await event({ event: sessionIdle() })
-      await until(() => client.promptCalls.length === 1)
+      await until(() => harness.logs.some(({ fields }) => fields["msg"] === "advisor pass end"))
 
       // Then
       expect(client.providerCalls).toBe(1)

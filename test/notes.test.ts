@@ -120,6 +120,8 @@ describe("NoteStore notes", () => {
       }),
       id: "20260910-123456-abcdef",
       time: "2026-09-10T12:34:56.000Z",
+      finding_id: note.finding_id,
+      issue_id: note.issue_id,
     })
   })
 
@@ -261,6 +263,7 @@ describe("NoteStore pending queue", () => {
     // Then
     expect(claimed).toEqual([])
     expect(logs).toContain("discarding stale pending pointer")
+    expect((await store.listNotes("/workspace/project", { last: 1 }))[0]?.expired_at).toBe("2026-09-10T12:20:00.000Z")
     expect(
       await readdir(join(dataDir, "pending", cwdKey("/workspace/project"))),
     ).toEqual([])
@@ -326,7 +329,7 @@ describe("NoteStore pending queue", () => {
 })
 
 describe("renderCard", () => {
-  test("renders the exact card with one display model mention and no private ids", () => {
+  test("renders a note identity with one display model mention and no private model ids", () => {
     // Given
     const note: Note = {
       ...noteInput({ is_fallback: true, variant: "max" }),
@@ -339,10 +342,11 @@ describe("renderCard", () => {
 
     // Then
     expect(card).toBe(
-      "Advisor · GPT-5.6 Sol (max) · concern · fallback\n" +
+      "◎ Advisor · GPT-5.6 Sol (max) · concern · fallback\n" +
         "reasoning: The result is inconsistent\n" +
         "note: Fix the shared boundary\n" +
-        "evidence: src/a.ts, test/a.test.ts",
+        "evidence: src/a.ts, test/a.test.ts\n" +
+        "finding: 20260910-123456-abcdef",
     )
     expect(card.match(/GPT-5\.6 Sol/g)).toHaveLength(1)
     expect(card).not.toContain(note.roster_name)
@@ -362,10 +366,24 @@ describe("renderCard", () => {
 
     // Then
     expect(card).toBe(
-      "Advisor · GPT-5.6 Sol (xhigh) · concern\n" +
+      "◎ Advisor · GPT-5.6 Sol (xhigh) · concern\n" +
         "reasoning: The result is inconsistent\n" +
-        "note: Fix the shared boundary",
+        "note: Fix the shared boundary\n" +
+        "finding: 20260910-123456-abcdef",
     )
+  })
+
+  test("opens the header with a severity glyph: ◉ blocker, ◎ concern, ○ nit", () => {
+    // Given
+    const base = { id: "20260910-123456-abcdef", time: "2026-09-10T12:34:56.000Z" }
+    const blocker: Note = { ...noteInput({ severity: "blocker" }), ...base }
+    const concern: Note = { ...noteInput({ severity: "concern" }), ...base }
+    const nit: Note = { ...noteInput({ severity: "nit" }), ...base }
+
+    // When / Then
+    expect(renderCard(blocker).split("\n")[0]).toBe("◉ Advisor · GPT-5.6 Sol (xhigh) · blocker")
+    expect(renderCard(concern).split("\n")[0]).toBe("◎ Advisor · GPT-5.6 Sol (xhigh) · concern")
+    expect(renderCard(nit).split("\n")[0]).toBe("○ Advisor · GPT-5.6 Sol (xhigh) · nit")
   })
 })
 

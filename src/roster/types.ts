@@ -26,6 +26,15 @@ export const DELIVERY_AGENT_ID = "advisor-delivery"
 
 export type KnownBuiltin = (typeof KNOWN_BUILTINS)[number]
 
+export const EDIT_TOOLS = ["edit", "write", "apply_patch", "patch", "multiedit"] as const
+export const SHELL_TOOLS = ["bash"] as const
+
+export type ReviewTrigger = Readonly<{
+  edits: readonly string[]
+  commands: readonly string[]
+  tools: readonly string[]
+}>
+
 export type RosterAdvisorInput = Readonly<{
   name: string
   enabled?: boolean
@@ -35,6 +44,9 @@ export type RosterAdvisorInput = Readonly<{
   instructions?: string
   prompt?: string
   min_severity?: AdvisorSeverity
+  chat_min_severity?: AdvisorSeverity
+  inject_min_severity?: AdvisorSeverity
+  when?: ReviewTrigger
 }>
 
 export type AdvisorEntry = Readonly<{
@@ -45,10 +57,15 @@ export type AdvisorEntry = Readonly<{
   tools: readonly KnownBuiltin[]
   instructions?: string
   min_severity: AdvisorSeverity
+  chat_min_severity: AdvisorSeverity
+  inject_min_severity: AdvisorSeverity
+  when?: ReviewTrigger
   slug: string
   agentId: string
   fallbackAgentId?: string
 }>
+
+export type AdvisorFloors = Pick<AdvisorEntry, "chat_min_severity" | "inject_min_severity">
 
 export type ParsedRoster = Readonly<{
   instructions?: string
@@ -77,6 +94,8 @@ export type RosterConfig = Pick<
   | "default_model"
   | "default_fallback"
   | "min_severity"
+  | "chat_min_severity"
+  | "inject_min_severity"
   | "provider_aliases"
   | "variant_aliases"
 >

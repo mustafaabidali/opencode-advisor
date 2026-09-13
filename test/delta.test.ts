@@ -166,7 +166,39 @@ describe("sliceDelta", () => {
 
     // Then
     expect(grown.delta.map(({ info }) => info.id)).toEqual(["user-1"])
+    expect(grown.delta[0]?.parts.map((part) => part.type === "text" ? part.text : part.type)).toEqual(["second"])
     expect(unchanged.delta).toEqual([])
+  })
+
+  test("a native card appended to the reviewed message is neither new work nor a reason to re-review its edits", () => {
+    // Given
+    const reviewed = [
+      transcript(assistantMessage("assistant-1", 20), [
+        textPart("assistant-1", "edited"),
+        completedTool("assistant-1", "edit", { filePath: "/repo/src/a.ts" }, "ok"),
+      ]),
+    ]
+    const cursor = sliceDelta(reviewed, {}).next
+    const carded = [
+      transcript(assistantMessage("assistant-1", 20), [
+        ...(reviewed[0]?.parts ?? []),
+        completedTool("assistant-1", "advisor", { noteID: "note-1" }, "◉ Advisor card"),
+        completedTool("assistant-1", "bash", { command: "advisor" }, "legacy card"),
+      ]),
+    ]
+
+    // When
+    const afterCard = sliceDelta(carded, cursor)
+    const afterNextStep = sliceDelta([
+      ...carded,
+      transcript(assistantMessage("assistant-2", 30), [textPart("assistant-2", "answer only")]),
+    ], afterCard.next)
+
+    // Then
+    expect(cursor).toEqual({ lastMessageID: "assistant-1", lastPartCount: 2 })
+    expect(afterCard.delta).toEqual([])
+    expect(afterCard.next).toEqual(cursor)
+    expect(afterNextStep.delta.map(({ info }) => info.id)).toEqual(["assistant-2"])
   })
 })
 
@@ -272,6 +304,7 @@ describe("renderDelta", () => {
       ]),
       transcript(assistantMessage("assistant-1", 3_000), [
         completedTool("assistant-1", "bash", { command: "advisor" }, "Advisor card"),
+        completedTool("assistant-1", "advisor", { noteID: "stored-note" }, "Native advisor card"),
         textPart("assistant-1", '<advisor severity="blocker">do this</advisor>', true),
         textPart("assistant-1", "visible"),
       ]),
@@ -284,6 +317,7 @@ describe("renderDelta", () => {
     expect(rendered).not.toContain("card request")
     expect(rendered).not.toContain("card result")
     expect(rendered).not.toContain("Advisor card")
+    expect(rendered).not.toContain("Native advisor card")
     expect(rendered).not.toContain("<advisor severity=")
     expect(rendered).toContain("[text] visible")
   })

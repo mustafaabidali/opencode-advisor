@@ -9,6 +9,7 @@ import type {
   RosterAdvisorInput,
   RosterConfig,
 } from "./types"
+import { whenField } from "./when"
 
 type ParseContext = Readonly<{
   config: RosterConfig
@@ -119,14 +120,12 @@ function inputEntry(
   if (rawEnabled !== undefined && typeof rawEnabled !== "boolean") {
     context.warnings.push(`${label} enabled must be boolean; using true`)
   }
-  const rawSeverity = value["min_severity"]
-  if (rawSeverity !== undefined && !isSeverity(rawSeverity)) {
-    context.warnings.push(`${label} min_severity is invalid; using the configured default`)
-  }
+  const severities = severityFields(value, entryContext)
   const model = modelField(value["model"], "model", entryContext)
   const fallback = modelField(value["fallback"], "fallback", entryContext)
   const tools = toolsField(value["tools"], entryContext)
   const instructions = instructionsField(value, entryContext)
+  const when = whenField(value["when"], entryContext)
   return {
     name,
     enabled: typeof rawEnabled === "boolean" ? rawEnabled : true,
@@ -134,8 +133,25 @@ function inputEntry(
     ...(fallback === undefined ? {} : { fallback }),
     ...(tools === undefined ? {} : { tools }),
     ...(instructions === undefined ? {} : { instructions }),
-    ...(isSeverity(rawSeverity) ? { min_severity: rawSeverity } : {}),
+    ...(when === undefined ? {} : { when }),
+    ...severities,
   }
+}
+
+const SEVERITY_KEYS = ["min_severity", "chat_min_severity", "inject_min_severity"] as const
+
+function severityFields(
+  record: Record<string, unknown>,
+  context: ParseContext & Readonly<{ label: string }>,
+): Partial<Record<(typeof SEVERITY_KEYS)[number], AdvisorSeverity>> {
+  const result: Partial<Record<(typeof SEVERITY_KEYS)[number], AdvisorSeverity>> = {}
+  for (const key of SEVERITY_KEYS) {
+    const raw = record[key]
+    if (raw === undefined) continue
+    if (isSeverity(raw)) result[key] = raw
+    else context.warnings.push(`${context.label} ${key} is invalid; using the configured default`)
+  }
+  return result
 }
 
 function parsedRoster(value: unknown, config: RosterConfig): ParsedRoster {

@@ -3,11 +3,13 @@ import type { Config as SdkConfig } from "@opencode-ai/sdk"
 
 import packageMetadata from "../package.json" with { type: "json" }
 import { AdvisorRuntime } from "./advisor"
+import { TaskContexts } from "./advisor/context"
 import { loadConfig, resolveDataDir } from "./config"
 import { Deliverer } from "./deliver"
 import { createLogger, type Logger } from "./log"
 import { CooldownRegistry, displayName } from "./models"
 import { NoteStore } from "./notes"
+import { rosterFloors } from "./roster"
 import {
   adaptPluginClient,
   toAdvisorClient,
@@ -22,6 +24,7 @@ import {
 } from "./plugin/support"
 import { safe } from "./safe"
 import { Watcher } from "./watcher"
+import { checkpointTool } from "./plugin/checkpoint"
 
 export type AdvisorPluginInput = Readonly<{
   client: AdvisorPluginClient
@@ -98,7 +101,10 @@ export async function createAdvisorHooks(
       clock: () => new Date(dependencies.clock()),
     })
     const cooldowns = new CooldownRegistry(dependencies.clock)
+    const contexts = new TaskContexts(store, input.directory)
     let watcher: Watcher<unknown> | undefined
+    let disposed = false
+    const isWatched = (sessionID: string) => !disposed && (watcher?.isWatched(sessionID) ?? false)
     const runtime = new AdvisorRuntime({
       config: loaded.config,
       roster,
@@ -117,17 +123,20 @@ export async function createAdvisorHooks(
       timers: dependencies.timers,
       readFile: dependencies.readFile,
       onAdvisorSession: (id) => watcher?.markAdvisorSession(id),
+      captureReview: (sessionID, messages) => contexts.capture(sessionID, messages),
       onWarning: (advisor, message) =>
         showRuntimeWarning(input.client, log, advisor, message),
     })
     const deliverer = new Deliverer({
       config: loaded.config,
+      floors: rosterFloors(roster),
+      context: (sessionID) => contexts.current(sessionID),
       store,
       log,
       client: input.client,
       directory: input.directory,
       clock: dependencies.clock,
-      isWatched: (sessionID) => watcher?.isWatched(sessionID) ?? false,
+      isWatched,
       suppress: (sessionID, milliseconds) =>
         watcher?.suppress(sessionID, milliseconds),
     })
@@ -138,14 +147,12 @@ export async function createAdvisorHooks(
       timers: dependencies.timers,
       client: toSessionClient(input.client),
       onPass: async (sessionID, reason) => {
+        if (disposed) return
         const firstUserText = watcher?.firstUserText(sessionID)
-        const results = await runtime.runPass(sessionID, reason, {
+        await runtime.runPass(sessionID, reason, {
           ...(firstUserText === undefined ? {} : { firstUserText }),
+          onResult: (result) => disposed ? undefined : deliverer.deliver(sessionID, result.notes),
         })
-        await deliverer.deliver(
-          sessionID,
-          results.flatMap((result) => result.notes),
-        )
       },
     })
 
@@ -161,6 +168,12 @@ export async function createAdvisorHooks(
     })
 
     return {
+      tool: {
+        advisor_checkpoint: checkpointTool({
+          client: input.client, config: loaded.config, contexts, log, store, directory: input.directory,
+          isWatched,
+        }),
+      },
       config: safe(log, "config", async (config) => {
         config.agent ??= {}
         const { plugin, ...sdkConfig } = config
@@ -168,11 +181,21 @@ export async function createAdvisorHooks(
         await runtime.registerAgents(sdkConfig satisfies SdkConfig)
       }),
       event: safe(log, "event", async ({ event }) => {
+        if (event.type === "server.instance.disposed" && event.properties.directory === input.directory) {
+          disposed = true
+          watcher.dispose()
+          await store.close()
+          return
+        }
+        if (disposed) return
+        if (event.type === "message.updated" && event.properties.info.role === "user") contexts.user(event.properties.info)
         await deliverer.onEvent(event)
         await watcher.handleEvent(event)
       }),
       "chat.message": safe(log, "chat.message", async (chatInput, output) => {
         if (chatInput.agent?.startsWith("advisor-") === true) return
+        deliverer.onUserMessage(output.message)
+        contexts.user(output.message)
         watcher.handleChatMessage(chatInput, output)
       }),
       "experimental.chat.messages.transform": safe(

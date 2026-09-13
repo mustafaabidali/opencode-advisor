@@ -11,6 +11,7 @@ import type { PromptResponse } from "../advisor/pass"
 import type { DeliveryClient } from "../deliver"
 import type { buildCatalog } from "../models"
 import type { SessionClient } from "../watcher"
+import { createNativeRenderer } from "./render"
 
 type ProviderRequest = Readonly<{
   query: Readonly<{ directory: string }>
@@ -37,6 +38,7 @@ type MessageResponse = readonly Readonly<{
 }>[]
 
 export type AdvisorPluginClient = Readonly<{
+  renderNote?: NonNullable<DeliveryClient["renderNote"]>
   session: Readonly<{
     create: (
       call: Parameters<AdvisorClient["session"]["create"]>[0],
@@ -107,6 +109,7 @@ export function adaptPluginClient(
   client: PluginInput["client"],
 ): AdvisorPluginClient {
   return {
+    renderNote: createNativeRenderer(client),
     session: {
       create: async (call) =>
         normalizeClientResult(

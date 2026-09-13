@@ -5,15 +5,16 @@
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "build": "bun build src/plugin.ts --target bun --outfile dist/advisor.js"
+    "build": "bun build src/plugin.ts --target bun --outfile dist/advisor.js && bun build src/notes/database-worker.ts --target bun --outfile dist/database-worker.js"
   },
   "dependencies": {
+    "@cerebras/cerebras_cloud_sdk": "^1.91.0",
     "@opencode-ai/plugin": "1.18.11",
     "@opencode-ai/sdk": "1.18.11",
     "yaml": "^2"
   },
   "devDependencies": {
-    "typescript": "^5",
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "typescript": "^5"
   }
 }

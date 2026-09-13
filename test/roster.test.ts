@@ -23,6 +23,7 @@ import {
   normalizeTools,
   parseRoster,
   resolveEntry,
+  rosterFloors,
   slugify,
   toAgentConfig,
   toFallbackAgentConfig,
@@ -154,6 +155,128 @@ describe("parseRoster", () => {
     // Then
     expect(result.advisors).toEqual([])
     expect(result.warnings).toEqual([expect.stringContaining("advisors")])
+  })
+})
+
+describe("parseRoster when triggers and per-entry floors", () => {
+  test("parses when.edits, when.commands, when.tools and leaves when undefined when absent", () => {
+    // Given
+    const text = `advisors:
+  - name: Gated
+    when:
+      edits: ["**/*.ts", "src/**"]
+      commands: ["\\\\bsed\\\\s+-i\\\\b"]
+      tools: [task, todowrite]
+  - name: Always`
+
+    // When
+    const result = parseRoster(text, CONFIG)
+
+    // Then
+    expect(result.advisors[0]?.when).toEqual({
+      edits: ["**/*.ts", "src/**"],
+      commands: ["\\bsed\\s+-i\\b"],
+      tools: ["task", "todowrite"],
+    })
+    expect(result.advisors[1]?.when).toBeUndefined()
+    expect(result.warnings).toEqual([])
+  })
+
+  test("rejects path-bearing and shell tool names in when.tools with a warning naming the right list", () => {
+    // Given
+    const text = `advisors:
+  - name: Gated
+    when:
+      tools: [edit, write, apply_patch, bash, task]`
+
+    // When
+    const result = parseRoster(text, CONFIG)
+
+    // Then
+    expect(result.advisors[0]?.when?.tools).toEqual(["task"])
+    expect(result.warnings).toEqual([
+      expect.stringContaining("edit"),
+      expect.stringContaining("write"),
+      expect.stringContaining("apply_patch"),
+      expect.stringContaining("bash"),
+    ])
+    expect(result.warnings[0]).toContain("when.edits")
+    expect(result.warnings[3]).toContain("when.commands")
+  })
+
+  test("drops an invalid regex from when.commands and keeps the rest", () => {
+    // Given
+    const text = `advisors:
+  - name: Gated
+    when:
+      commands: ["(", "\\\\btee\\\\b"]`
+
+    // When
+    const result = parseRoster(text, CONFIG)
+
+    // Then
+    expect(result.advisors[0]?.when?.commands).toEqual(["\\btee\\b"])
+    expect(result.warnings).toEqual([expect.stringContaining("commands")])
+  })
+
+  test("fails closed: a when with no usable triggers keeps the entry as never-firing and warns", () => {
+    // Given
+    const empty = `advisors:
+  - name: Empty
+    when: {}`
+    const allInvalid = `advisors:
+  - name: Broken
+    when:
+      commands: ["("]`
+    const notObject = `advisors:
+  - name: Wrong
+    when: always`
+
+    // When
+    const results = [empty, allInvalid, notObject].map((text) => parseRoster(text, CONFIG))
+
+    // Then
+    for (const result of results) {
+      expect(result.advisors).toHaveLength(1)
+      expect(result.advisors[0]?.when).toEqual({ edits: [], commands: [], tools: [] })
+      expect(result.warnings.at(-1)).toContain("will never run")
+    }
+  })
+
+  test("parses per-entry chat and inject floors and falls back to config for invalid values", () => {
+    // Given
+    const text = `advisors:
+  - name: Quiet
+    chat_min_severity: blocker
+    inject_min_severity: concern
+  - name: Loud
+    chat_min_severity: shout`
+
+    // When
+    const result = parseRoster(text, { ...CONFIG, chat_min_severity: "nit", inject_min_severity: "blocker" })
+
+    // Then
+    expect(result.advisors[0]?.chat_min_severity).toBe("blocker")
+    expect(result.advisors[0]?.inject_min_severity).toBe("concern")
+    expect(result.advisors[1]?.chat_min_severity).toBe("nit")
+    expect(result.advisors[1]?.inject_min_severity).toBe("blocker")
+    expect(result.warnings).toEqual([expect.stringContaining("chat_min_severity")])
+  })
+
+  test("rosterFloors resolves an entry's floors by slug and undefined for unknown slugs", () => {
+    // Given
+    const roster = [
+      resolved({ name: "Quiet", chat_min_severity: "blocker", inject_min_severity: "concern" }),
+      resolved({ name: "Loud", chat_min_severity: "nit", inject_min_severity: "blocker" }),
+    ]
+
+    // When
+    const floors = rosterFloors(roster)
+
+    // Then
+    expect(floors("quiet")).toEqual({ chat_min_severity: "blocker", inject_min_severity: "concern" })
+    expect(floors("loud")).toEqual({ chat_min_severity: "nit", inject_min_severity: "blocker" })
+    expect(floors("nobody")).toBeUndefined()
   })
 })
 

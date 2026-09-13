@@ -69,7 +69,10 @@ export class PassScheduler<Timer> {
 
   forget(sessionID: string): void {
     const state = this.states.get(sessionID)
-    if (state !== undefined) this.clearTimer(state)
+    if (state !== undefined) {
+      state.dirty = false
+      this.clearTimer(state)
+    }
     this.states.delete(sessionID)
   }
 
