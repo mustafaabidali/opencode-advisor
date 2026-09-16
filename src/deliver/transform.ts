@@ -86,7 +86,11 @@ export class BlockerTransformer {
   }
 
   messagesTransform(output: MessagesTransformOutput, assessedIDs?: ReadonlySet<string>): void {
-    output.messages = output.messages.filter((message) => !message.info.id.startsWith("adv_"))
+    // OpenCode keeps its own reference to this array and converts it for the
+    // model after the hook returns, so every change must happen in place.
+    for (let index = output.messages.length - 1; index >= 0; index -= 1) {
+      if (output.messages[index]?.info.id.startsWith("adv_") === true) output.messages.splice(index, 1)
+    }
     const sessionID = output.messages[0]?.info.sessionID
     if (
       sessionID === undefined ||

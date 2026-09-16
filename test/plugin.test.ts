@@ -597,14 +597,19 @@ describe("advisor plugin entry", () => {
       await hooks.event?.({ event: sessionCreated(harness.directory) })
       await hooks.event?.({ event: sessionIdle() })
       await until(() => calls === 2 && harness.logs.some(({ fields }) => fields["msg"] === "advisor card withheld"))
-      const output = { messages: [{ ...userTranscriptMessage(ROOT_SENTINEL), parts: [] as Part[] }] }
+      // OpenCode passes {messages} to the hook, ignores the wrapper afterwards, and
+      // converts this same array for the model; the concern must land in it.
+      const modelMessages = [{ ...userTranscriptMessage(ROOT_SENTINEL), parts: [] as Part[] }]
+      const output = { messages: modelMessages }
       await hooks["experimental.chat.messages.transform"]?.({}, output)
-      expect(JSON.stringify(output)).toContain("Fix 1")
+      expect(output.messages).toBe(modelMessages)
+      expect(JSON.stringify(modelMessages)).toContain("Fix 1")
       expect(slowDone).toBeFalse()
       slow.resolve()
       await until(() => harness.logs.filter(({ fields }) => fields["msg"] === "advisor card withheld").length === 2)
       await hooks["experimental.chat.messages.transform"]?.({}, output)
-      expect(JSON.stringify(output)).toContain("Fix 2")
+      expect(output.messages).toBe(modelMessages)
+      expect(JSON.stringify(modelMessages)).toContain("Fix 2")
       expect(fake.abortCalls).toHaveLength(0)
     } finally {
       slow.resolve()

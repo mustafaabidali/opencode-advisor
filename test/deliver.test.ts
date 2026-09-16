@@ -867,16 +867,33 @@ describe("Deliverer blocker transform", () => {
     await status(harness.deliverer, "idle")
     await harness.deliverer.deliver("root-1", [note("concern-1"), note("nit-1", "nit")])
     const output = { messages: [userMessage("u-1")] }
+    // OpenCode retains this array and converts it for the model after the hook returns.
+    const modelMessages = output.messages
 
     // When
     await harness.deliverer.messagesTransform(output)
 
     // Then
     expect(harness.shellCalls).toHaveLength(0)
-    expect(output.messages.map((message) => message.info.id)).toEqual(["adv_concern-1", "u-1"])
-    const text = output.messages[0]?.parts[0]
+    expect(output.messages).toBe(modelMessages)
+    expect(modelMessages.map((message) => message.info.id)).toEqual(["adv_concern-1", "u-1"])
+    const text = modelMessages[0]?.parts[0]
     expect(text?.type === "text" ? text.text : "").toContain('<advisor severity="concern"')
     expect(text?.type === "text" ? text.text : "").toContain("Honor the user's latest steering first")
+  })
+
+  test("removes stale synthetic notes from the caller's array in place without injecting", async () => {
+    // Given
+    const harness = makeHarness({ watched: false })
+    const output = { messages: [userMessage("adv_old-note"), userMessage("u-1"), userMessage("adv_other")] }
+    const modelMessages = output.messages
+
+    // When
+    await harness.deliverer.messagesTransform(output)
+
+    // Then
+    expect(output.messages).toBe(modelMessages)
+    expect(modelMessages.map((message) => message.info.id)).toEqual(["u-1"])
   })
 })
 
